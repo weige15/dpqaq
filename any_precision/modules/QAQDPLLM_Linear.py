@@ -110,6 +110,8 @@ class QAQDPLLM_Linear(nn.Module):
         return y
 
     def _is_prefill(self, x):
+        if x.dim() >= 3:
+            return x.shape[-2] > 1
         return x.numel() // x.shape[-1] > 1
 
     def _valid_bits(self):

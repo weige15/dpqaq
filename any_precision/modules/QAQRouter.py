@@ -17,6 +17,7 @@ class QAQRouter(nn.Module):
             hidden_size: int,
             num_layers: int,
             bits: list[int],
+            input_feature_dim: int | None = None,
             router_hidden_dim: int = 256,
             router_layers: int = 2,
             layer_embedding_dim: int = 32,
@@ -33,6 +34,7 @@ class QAQRouter(nn.Module):
             raise ValueError("bits must be unique")
 
         self.hidden_size = int(hidden_size)
+        self.input_feature_dim = int(input_feature_dim) if input_feature_dim is not None else int(hidden_size)
         self.num_layers = int(num_layers)
         self.bits = [int(bit) for bit in bits]
         self.router_hidden_dim = int(router_hidden_dim)
@@ -45,7 +47,7 @@ class QAQRouter(nn.Module):
         self.layer_embedding = nn.Embedding(self.num_layers, self.layer_embedding_dim)
 
         scalar_dim = int(self.use_norm_feature) + int(self.use_estimated_error)
-        input_dim = self.hidden_size + self.layer_embedding_dim + scalar_dim
+        input_dim = self.input_feature_dim + self.layer_embedding_dim + scalar_dim
 
         layers: list[nn.Module] = []
         current_dim = input_dim
@@ -59,9 +61,17 @@ class QAQRouter(nn.Module):
         self.mlp = nn.Sequential(*layers)
 
     def _flat_hidden(self, x: torch.Tensor) -> torch.Tensor:
-        if x.shape[-1] != self.hidden_size:
-            raise ValueError(f"expected hidden size {self.hidden_size}, got {x.shape[-1]}")
-        return x.reshape(-1, self.hidden_size)
+        feature_dim = x.shape[-1]
+        if feature_dim > self.input_feature_dim:
+            raise ValueError(
+                f"expected input feature dim <= {self.input_feature_dim}, got {feature_dim}"
+            )
+        flat_x = x.reshape(-1, feature_dim)
+        if feature_dim < self.input_feature_dim:
+            padded = flat_x.new_zeros(flat_x.shape[0], self.input_feature_dim)
+            padded[:, :feature_dim] = flat_x
+            flat_x = padded
+        return flat_x
 
     def _flat_layer_ids(self, layer_ids: int | torch.Tensor, count: int, device: torch.device) -> torch.Tensor:
         if isinstance(layer_ids, int):
@@ -107,6 +117,7 @@ class QAQRouter(nn.Module):
     def config_dict(self) -> dict[str, Any]:
         return {
             "hidden_size": self.hidden_size,
+            "input_feature_dim": self.input_feature_dim,
             "num_layers": self.num_layers,
             "bits": list(self.bits),
             "router_hidden_dim": self.router_hidden_dim,
@@ -123,6 +134,7 @@ class QAQRouter(nn.Module):
             hidden_size=int(config["hidden_size"]),
             num_layers=int(config["num_layers"]),
             bits=[int(bit) for bit in config["bits"]],
+            input_feature_dim=int(config.get("input_feature_dim", config["hidden_size"])),
             router_hidden_dim=int(config.get("router_hidden_dim", 256)),
             router_layers=int(config.get("router_layers", 2)),
             layer_embedding_dim=int(config.get("layer_embedding_dim", 32)),
@@ -147,6 +159,7 @@ def build_qaq_router_checkpoint(
         "router_state_dict": router.state_dict(),
         "candidate_bits": list(router.bits),
         "hidden_size": router.hidden_size,
+        "input_feature_dim": router.input_feature_dim,
         "num_layers": router.num_layers,
         "training_config": training_config or {},
         "label_mode": label_mode,

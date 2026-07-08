@@ -1,21 +1,25 @@
 import torch
 from functools import partial
 
+
+def _move_to_device(value, device):
+    if torch.is_tensor(value):
+        return value.to(device)
+    if isinstance(value, tuple):
+        return tuple(_move_to_device(item, device) for item in value)
+    if isinstance(value, list):
+        return [_move_to_device(item, device) for item in value]
+    if isinstance(value, dict):
+        return {key: _move_to_device(item, device) for key, item in value.items()}
+    return value
+
+
 # Forward wrapper function to record hidden states as well as miscellaneous inputs
-def decoder_layer_forward_wrap(self, orig_fn, xarr, misc_inputs,
-                    hidden_states,
-                    attention_mask,
-                    position_ids,
-                    past_key_value,
-                    output_attentions,
-                    use_cache,
-                    cache_position,
-                    position_embeddings,
-                ):
+def decoder_layer_forward_wrap(self, orig_fn, xarr, misc_inputs, hidden_states, *args, **kwargs):
     xarr.append(hidden_states.clone().cpu())
     if len(misc_inputs) == 0:
-        misc_inputs.extend([attention_mask, position_ids, past_key_value, output_attentions, use_cache, cache_position, position_embeddings])
-    return orig_fn(hidden_states, attention_mask, position_ids, past_key_value, output_attentions, use_cache, cache_position, position_embeddings)
+        misc_inputs.extend([tuple(args), dict(kwargs)])
+    return orig_fn(hidden_states, *args, **kwargs)
 
 @torch.no_grad()
 def getLayer0Inputs(model, dataset, device="cuda") -> tuple[list, tuple]:
@@ -96,8 +100,15 @@ def getX(model, layer, module_list, layerX, misc_inputs, device="cuda") -> tuple
     # Do forward for layer
     layer_out_arr = []
     for batch in layerX:
-        out = curr_layer(batch.to(device), *misc_inputs)
-        layer_out_arr.append(out[0].clone().cpu())
+        if len(misc_inputs) == 2 and isinstance(misc_inputs[0], tuple) and isinstance(misc_inputs[1], dict):
+            replay_args = _move_to_device(misc_inputs[0], device)
+            replay_kwargs = _move_to_device(misc_inputs[1], device)
+            out = curr_layer(batch.to(device), *replay_args, **replay_kwargs)
+        else:
+            replay_args = _move_to_device(misc_inputs, device)
+            out = curr_layer(batch.to(device), *replay_args)
+        hidden_out = out[0] if isinstance(out, (tuple, list)) else out
+        layer_out_arr.append(hidden_out.clone().cpu())
 
     # Clean up
     for handle in handle_list:

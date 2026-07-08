@@ -314,8 +314,23 @@ def main():
         raise ValueError("--include_estimated_error requires --estimator_results")
     linear_reg_d, jl_d = load_estimator_results(args.estimator_results)
 
+    model_ap = AnyPrecisionForCausalLM.from_quantized(
+        args.ap_model_path,
+        precisions=bits,
+        trust_remote_code=args.trust_remote_code,
+    ).eval()
+    ap_layers = model_ap.get_model_layers()
+
+    max_input_features = 0
+    for route in route_map:
+        linear = ap_layers[route["layer"]]._modules[route["parent"]]._modules[route["name"]]
+        route["in_features"] = int(linear.in_features)
+        route["out_features"] = int(linear.out_features)
+        max_input_features = max(max_input_features, int(linear.in_features))
+
     router = QAQRouter(
         hidden_size=config.hidden_size,
+        input_feature_dim=max_input_features,
         num_layers=len(route_map),
         bits=bits,
         router_hidden_dim=args.router_hidden_dim,
@@ -337,13 +352,6 @@ def main():
         trust_remote_code=args.trust_remote_code,
     ).eval()
     model_orig.config.use_cache = False
-
-    model_ap = AnyPrecisionForCausalLM.from_quantized(
-        args.ap_model_path,
-        precisions=bits,
-        trust_remote_code=args.trust_remote_code,
-    ).eval()
-    ap_layers = model_ap.get_model_layers()
 
     dataloader = getDataLoader(args.dataset, tokenizer, args.context_length, args.dataset_length)
 
