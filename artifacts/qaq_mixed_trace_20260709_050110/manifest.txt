@@ -1,0 +1,77 @@
+QAQ mixed-workload profile trace and simulator run
+
+Status:
+- Real QAQ generation trace collection: COMPLETE
+- Trace-driven simulator replay: COMPLETE
+- Dynamic batching performance validation: UNVALIDATED
+- Profile-diversity conclusion: UNVALIDATED
+- Quality validation: UNVALIDATED
+- Finite-logit check: UNVALIDATED (not requested for this run)
+- Transfer/kernel-switch metrics: UNVALIDATED
+
+Dataset/source:
+- Chat/general instruction: locally cached tatsu-lab/alpaca train Arrow shard, 4 prompts
+- Math: locally cached tatsu-lab/alpaca train Arrow shard, 4 prompts
+- Code/programming: locally cached tatsu-lab/alpaca train Arrow shard, 4 prompts
+- Summarization: locally cached allenai/c4 validation Arrow shard, 4 prompts
+- Alpaca source path: /nfs/home/s314511048/.cache/huggingface/datasets/tatsu-lab___alpaca/default/0.0.0/dce01c9b08f87459cf36a430d809084718273017/alpaca-train.arrow
+- C4 source path: /nfs/home/s314511048/.cache/huggingface/datasets/allenai___c4/default-4cb1202b07c0cd0b/0.0.0/607bd4c8450a42878aa9ddc051a65a055450ef87/c4-validation.arrow
+
+Environment:
+- CUDA_VISIBLE_DEVICES=0
+- GPU: NVIDIA GeForce RTX 3090
+- AP_MODEL_PATH=/nfs/home/s314511048/dpqaq/cache/packed/anyprec-(Meta-Llama-3.1-8B)-w6_orig3-gc1-c4_s100_blk512
+- Router checkpoint: checkpoints/qaq_router_llama31_8b_th005.pt
+- Estimator results: estimator_private_values/anyprec-(Meta-Llama-3.1-8B)-w6_orig3-gc1-c4_s100_blk512/finetuned_max6.0_3b-6b_th_pb_train_0.01_1.0_1ep_targ4.5b_init_0-40_adam
+
+Trace command:
+CUDA_VISIBLE_DEVICES=0 python scripts/collect_qaq_profile_traces.py \
+  --ap_model_path "$AP_MODEL_PATH" \
+  --router_checkpoint checkpoints/qaq_router_llama31_8b_th005.pt \
+  --estimator_results 'estimator_private_values/anyprec-(Meta-Llama-3.1-8B)-w6_orig3-gc1-c4_s100_blk512/finetuned_max6.0_3b-6b_th_pb_train_0.01_1.0_1ep_targ4.5b_init_0-40_adam' \
+  --bits 3 4 5 6 \
+  --router_mode mlp_multibit_dp_guard \
+  --prompt_file artifacts/qaq_mixed_trace_20260709_050110/prompts.jsonl \
+  --max_requests 16 \
+  --workload_type mixed \
+  --max_new_tokens 8 \
+  --device cuda \
+  --output_jsonl artifacts/qaq_mixed_trace_20260709_050110/qaq_trace.jsonl \
+  --summary_json artifacts/qaq_mixed_trace_20260709_050110/qaq_trace_summary.json
+
+Simulation command:
+python scripts/simulate_qaq_dynamic_batching.py \
+  --trace_jsonl artifacts/qaq_mixed_trace_20260709_050110/qaq_trace.jsonl \
+  --output_json artifacts/qaq_mixed_trace_20260709_050110/qaq_batching_simulation.json \
+  --max_batch_size 4 \
+  --max_wait_ms 200 \
+  --compatibility_threshold 0.25 \
+  --scalar_bucket_size 0.25 \
+  --quantile 0.75
+
+Trace validation summary:
+- record_count: 16
+- schema_version: qaq_dynamic_batching_trace_v1
+- chat: n=4, avg_selected_bit_mean=5.581, avg_selected_bit_range=(5.558, 5.597), effective_bits_mean=5.535, fallback_total=0, dp_guard_trigger_total=119, latency_ms_range=(1822.30, 2315.38)
+- code: n=4, avg_selected_bit_mean=5.772, avg_selected_bit_range=(5.713, 5.870), effective_bits_mean=5.724, fallback_total=0, dp_guard_trigger_total=143, latency_ms_range=(1827.85, 1839.12)
+- math: n=4, avg_selected_bit_mean=5.760, avg_selected_bit_range=(5.678, 5.836), effective_bits_mean=5.730, fallback_total=0, dp_guard_trigger_total=112, latency_ms_range=(1833.70, 1856.84)
+- summarization: n=4, avg_selected_bit_mean=5.973, avg_selected_bit_range=(5.969, 5.976), effective_bits_mean=5.970, fallback_total=0, dp_guard_trigger_total=318, latency_ms_range=(1814.76, 1843.47)
+
+Simulation summary, SIMULATED_ONLY:
+- ordinary_dynamic_batching: batches=4, mean_batch=4.00, p95_latency_ms=7611.06, requests_per_s=2.018
+- scalar_budget_batching: batches=4, mean_batch=4.00, p95_latency_ms=7612.14, requests_per_s=2.017
+- block_profile_batching: batches=4, mean_batch=4.00, p95_latency_ms=7611.06, requests_per_s=2.018
+- max_profile_sharing: batches=4, mean_batch=4.00, p95_latency_ms=7943.54, requests_per_s=1.937
+- quantile_profile_sharing: batches=4, mean_batch=4.00, p95_latency_ms=7943.54, requests_per_s=1.937
+
+Interpretation caveat:
+- This run gives an initial mixed-workload trace artifact.
+- It is too small for profile-diversity or batching-performance conclusions.
+- The simulator output is only a policy/plumbing replay over single-request timings.
+
+Artifacts:
+- prompts.jsonl
+- qaq_trace.jsonl
+- qaq_trace_summary.json
+- qaq_batching_simulation.json
+- manifest.txt

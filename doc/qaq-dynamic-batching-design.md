@@ -197,6 +197,25 @@ JSONL record per request. It validates trace extraction only. It does not
 validate dynamic batching, queueing behavior, quality preservation, transfer
 bytes, kernel-switch counts, or throughput improvement.
 
+The first trace-driven simulator entry point is:
+
+```bash
+cd /nfs/home/s314511048/dpqaq
+python scripts/simulate_qaq_dynamic_batching.py \
+  --trace_jsonl artifacts/qaq_trace.jsonl \
+  --output_json artifacts/qaq_batching_simulation.json \
+  --max_batch_size 4 \
+  --max_wait_ms 200 \
+  --compatibility_threshold 0.25 \
+  --scalar_bucket_size 0.25 \
+  --quantile 0.75
+```
+
+The simulator consumes observed per-request QAQ profiles and measured
+single-request generation times. It produces scheduling and profile-sharing
+metrics under explicit assumptions. Its output is `SIMULATED_ONLY` and cannot
+support real throughput or latency claims without GPU-server replay.
+
 ## Validation Gates
 
 ### Gate 0: Existing QAQ Correctness

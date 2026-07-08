@@ -1,0 +1,104 @@
+QAQ larger mixed-workload profile trace and simulator run
+
+Status:
+- Real QAQ generation trace collection: COMPLETE
+- Trace-driven simulator replay: COMPLETE
+- Dynamic batching GPU-server performance validation: UNVALIDATED
+- Profile-diversity statistics: DESCRIPTIVE_ONLY, not a paper claim
+- Quality validation: UNVALIDATED
+- Transfer/kernel-switch metrics: UNVALIDATED
+- Finite-logit check: UNVALIDATED (not requested for this run)
+
+Prompt set:
+- Total requests: 200
+- chat/general instruction: 50 prompts from cached tatsu-lab/alpaca train Arrow shard
+- math: 50 prompts from cached tatsu-lab/alpaca train Arrow shard
+- code/programming: 50 prompts from cached tatsu-lab/alpaca train Arrow shard
+- summarization: 50 prompts from cached allenai/c4 validation Arrow shard
+- Alpaca source path: /nfs/home/s314511048/.cache/huggingface/datasets/tatsu-lab___alpaca/default/0.0.0/dce01c9b08f87459cf36a430d809084718273017/alpaca-train.arrow
+- C4 source path: /nfs/home/s314511048/.cache/huggingface/datasets/allenai___c4/default-4cb1202b07c0cd0b/0.0.0/607bd4c8450a42878aa9ddc051a65a055450ef87/c4-validation.arrow
+
+Environment:
+- CUDA_VISIBLE_DEVICES=0
+- GPU: NVIDIA GeForce RTX 3090
+- AP_MODEL_PATH=/nfs/home/s314511048/dpqaq/cache/packed/anyprec-(Meta-Llama-3.1-8B)-w6_orig3-gc1-c4_s100_blk512
+- Router checkpoint: checkpoints/qaq_router_llama31_8b_th005.pt
+- Estimator results: estimator_private_values/anyprec-(Meta-Llama-3.1-8B)-w6_orig3-gc1-c4_s100_blk512/finetuned_max6.0_3b-6b_th_pb_train_0.01_1.0_1ep_targ4.5b_init_0-40_adam
+
+Trace command:
+CUDA_VISIBLE_DEVICES=0 python scripts/collect_qaq_profile_traces.py --ap_model_path "$AP_MODEL_PATH" --router_checkpoint checkpoints/qaq_router_llama31_8b_th005.pt --estimator_results 'estimator_private_values/anyprec-(Meta-Llama-3.1-8B)-w6_orig3-gc1-c4_s100_blk512/finetuned_max6.0_3b-6b_th_pb_train_0.01_1.0_1ep_targ4.5b_init_0-40_adam' --bits 3 4 5 6 --router_mode mlp_multibit_dp_guard --prompt_file artifacts/qaq_mixed_trace_20260709_050923/prompts.jsonl --max_requests 200 --workload_type mixed --max_new_tokens 8 --device cuda --output_jsonl artifacts/qaq_mixed_trace_20260709_050923/qaq_trace.jsonl --summary_json artifacts/qaq_mixed_trace_20260709_050923/qaq_trace_summary.json
+
+Simulation command:
+python scripts/simulate_qaq_dynamic_batching.py --trace_jsonl artifacts/qaq_mixed_trace_20260709_050923/qaq_trace.jsonl --output_json artifacts/qaq_mixed_trace_20260709_050923/qaq_batching_simulation.json --max_batch_size 4 --max_wait_ms 200 --compatibility_threshold 0.25 --scalar_bucket_size 0.25 --quantile 0.75
+
+Trace validation summary:
+- record_count: 200
+- schema_versions: ['qaq_dynamic_batching_trace_v1']
+- workload_counts: {'chat': 50, 'code': 50, 'math': 50, 'summarization': 50}
+- fallback_total: 0
+- dp_guard_trigger_total: 5901
+- average_selected_bit_mean: 5.8326
+- effective_bits_mean: 5.8103
+- observed_output_length_histogram note: summarization split between 1-token and 8-token completions in this run
+
+Workload descriptive stats:
+- chat: n=50, avg_selected_bit_mean=5.7465, avg_selected_bit_range=(5.6292, 5.9273), effective_bits_mean=5.7175, fallback_total=0, dp_guard_trigger_total=1607, coarse_profile_unique=9, scalar_bucket_0_25_unique=2, output_lengths={'8': 50}
+- code: n=50, avg_selected_bit_mean=5.7921, avg_selected_bit_range=(5.6491, 5.9004), effective_bits_mean=5.7593, fallback_total=0, dp_guard_trigger_total=1557, coarse_profile_unique=11, scalar_bucket_0_25_unique=2, output_lengths={'8': 50}
+- math: n=50, avg_selected_bit_mean=5.8037, avg_selected_bit_range=(5.6893, 5.9459), effective_bits_mean=5.7782, fallback_total=0, dp_guard_trigger_total=1688, coarse_profile_unique=11, scalar_bucket_0_25_unique=2, output_lengths={'6': 2, '7': 1, '8': 47}
+- summarization: n=50, avg_selected_bit_mean=5.9879, avg_selected_bit_range=(5.9530, 6.0000), effective_bits_mean=5.9861, fallback_total=0, dp_guard_trigger_total=1049, coarse_profile_unique=1, scalar_bucket_0_25_unique=2, output_lengths={'1': 25, '8': 25}
+
+Profile diversity summary, descriptive only:
+- scalar_bucket_0_25_unique: 3
+- scalar_bucket_0_10_unique: 5
+- majority_profile_unique: 1
+- coarse_profile_unique: 18
+- coarse_profile_fragmentation_ratio: 0.0900
+- mean_pairwise_route_expected_bit_distance: 0.1312
+
+Simulation summary, SIMULATED_ONLY:
+- block_profile_batching: batches=50, mean_batch=4.0000, p95_latency_ms=89742.00, requests_per_s_simulated=2.1361, lane_occupancy={'block_48e6d908a259': 200}
+- max_profile_sharing: batches=50, mean_batch=4.0000, p95_latency_ms=92488.85, requests_per_s_simulated=2.0750, lane_occupancy={'max': 200}
+- ordinary_dynamic_batching: batches=50, mean_batch=4.0000, p95_latency_ms=89742.00, requests_per_s_simulated=2.1361, lane_occupancy={'ordinary': 200}
+- quantile_profile_sharing: batches=50, mean_batch=4.0000, p95_latency_ms=92488.85, requests_per_s_simulated=2.0750, lane_occupancy={'quantile': 200}
+- scalar_budget_batching: batches=51, mean_batch=3.9216, p95_latency_ms=80861.94, requests_per_s_simulated=2.3560, lane_occupancy={'scalar_bucket_22': 56, 'scalar_bucket_23': 119, 'scalar_bucket_24': 25}
+
+Interpretation caveats:
+- This artifact is larger than the 16-request pilot and can be used for first-pass profile diversity and fragmentation analysis.
+- It still cannot support real dynamic batching speedup claims because the scheduler results are simulator-only.
+- Majority-bit profiles collapsed to one profile in this trace; expected-bit coarse profiles varied. That is an observation about this trace, not a general workload conclusion.
+- Summarization completions split between 1 and 8 generated tokens, so latency/profile comparisons should condition on observed output length.
+- Quality metrics, under-precision labels, over-precision labels, transfer bytes, HBM bytes, kernel switches, and CUDA graph reuse remain UNVALIDATED.
+
+Artifacts:
+- prompts.jsonl
+- qaq_trace.jsonl
+- qaq_trace_summary.json
+- qaq_batching_simulation.json
+- qaq_profile_diversity_summary.json
+- manifest.txt
+
+Plot artifacts:
+- figures/fig_bits_by_workload.pdf and .png
+- figures/fig_profile_fragmentation_by_workload.pdf and .png
+- figures/fig_coarse_profile_occupancy_heatmap.pdf and .png
+- figures/fig_simulated_policy_tradeoff.pdf and .png
+- figures/fig_lane_occupancy_by_policy.pdf and .png
+- figures/fig_gpu_replay_policy_comparison.pdf and .png
+- figures/plot_manifest.json
+
+Simulator-selected validation target:
+- candidate_policy: scalar_budget_batching
+- basis: SIMULATED_ONLY policy tradeoff had lower simulated p95 latency and higher simulated requests/sec than the other policies in this trace replay.
+- caveat: this selects a policy to validate; it does not prove a speedup.
+
+Real GPU batched replay:
+- ordinary_dynamic_batching artifact: gpu_replay_ordinary_dynamic_batching.json
+- scalar_budget_batching artifact: gpu_replay_scalar_budget_batching.json
+- comparison artifact: gpu_replay_comparison.json
+- replay status: REAL_GPU_BATCHED_REPLAY_NO_SHARED_PROFILE_OVERRIDES
+- padding_side: left
+- warmup_batches: 1
+- repeat: 1
+- ordinary_dynamic_batching: batches=50, requests=200, mean_batch_gpu_ms=2132.13, p95_batch_gpu_ms=2398.15, token_slots_per_s=14.746
+- scalar_budget_batching: batches=51, requests=200, mean_batch_gpu_ms=1868.20, p95_batch_gpu_ms=2328.68, token_slots_per_s=14.956
+- replay caveat: one repeat only; no queue delay replay; no max/quantile shared-profile override; generated tokens are returned token slots for padded batches; no quality metric.

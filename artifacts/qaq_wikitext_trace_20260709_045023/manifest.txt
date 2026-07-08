@@ -1,0 +1,71 @@
+QAQ WikiText2 profile trace and simulator run
+
+Status:
+- Real QAQ generation trace collection: COMPLETE
+- Trace-driven simulator replay: COMPLETE
+- Dynamic batching performance validation: UNVALIDATED
+- Profile-diversity conclusion: UNVALIDATED
+- Quality validation: UNVALIDATED
+- Finite-logit check: UNVALIDATED (not requested for this run)
+- Transfer/kernel-switch metrics: UNVALIDATED
+
+Dataset/source:
+- Source: locally cached WikiText2 validation Arrow shard
+- Source path: /nfs/home/s314511048/.cache/huggingface/datasets/Salesforce___wikitext/wikitext-2-raw-v1/0.0.0/b08601e04326c79dfdd32d625aee71d232d685c3/wikitext-validation.arrow
+- Prompt count: 16
+- Prompt transform: "Continue this WikiText passage in one concise sentence: <passage prefix>"
+
+Environment:
+- CUDA_VISIBLE_DEVICES=0
+- GPU: NVIDIA GeForce RTX 3090
+- AP_MODEL_PATH=/nfs/home/s314511048/dpqaq/cache/packed/anyprec-(Meta-Llama-3.1-8B)-w6_orig3-gc1-c4_s100_blk512
+- Router checkpoint: checkpoints/qaq_router_llama31_8b_th005.pt
+- Estimator results: estimator_private_values/anyprec-(Meta-Llama-3.1-8B)-w6_orig3-gc1-c4_s100_blk512/finetuned_max6.0_3b-6b_th_pb_train_0.01_1.0_1ep_targ4.5b_init_0-40_adam
+
+Trace command:
+CUDA_VISIBLE_DEVICES=0 python scripts/collect_qaq_profile_traces.py \
+  --ap_model_path "$AP_MODEL_PATH" \
+  --router_checkpoint checkpoints/qaq_router_llama31_8b_th005.pt \
+  --estimator_results 'estimator_private_values/anyprec-(Meta-Llama-3.1-8B)-w6_orig3-gc1-c4_s100_blk512/finetuned_max6.0_3b-6b_th_pb_train_0.01_1.0_1ep_targ4.5b_init_0-40_adam' \
+  --bits 3 4 5 6 \
+  --router_mode mlp_multibit_dp_guard \
+  --prompt_file artifacts/qaq_wikitext_trace_20260709_045023/prompts.jsonl \
+  --max_requests 16 \
+  --workload_type wikitext_continuation \
+  --max_new_tokens 8 \
+  --device cuda \
+  --output_jsonl artifacts/qaq_wikitext_trace_20260709_045023/qaq_trace.jsonl \
+  --summary_json artifacts/qaq_wikitext_trace_20260709_045023/qaq_trace_summary.json
+
+Simulation command:
+python scripts/simulate_qaq_dynamic_batching.py \
+  --trace_jsonl artifacts/qaq_wikitext_trace_20260709_045023/qaq_trace.jsonl \
+  --output_json artifacts/qaq_wikitext_trace_20260709_045023/qaq_batching_simulation.json \
+  --max_batch_size 4 \
+  --max_wait_ms 200 \
+  --compatibility_threshold 0.25 \
+  --scalar_bucket_size 0.25 \
+  --quantile 0.75
+
+Trace validation summary:
+- record_count: 16
+- schema_version: qaq_dynamic_batching_trace_v1
+- average_selected_bit_min_max: 5.881, 5.970
+- effective_bits_min_max: 5.862, 5.965
+- fallback_total: 0
+- dp_guard_trigger_total: 813
+- latency_ms_min_max: 2308.54, 2896.23
+
+Simulation summary, SIMULATED_ONLY:
+- ordinary_dynamic_batching: batches=4, mean_batch=4.00, p95_latency_ms=9674.19, requests_per_s=1.601
+- scalar_budget_batching: batches=4, mean_batch=4.00, p95_latency_ms=9674.19, requests_per_s=1.601
+- block_profile_batching: batches=4, mean_batch=4.00, p95_latency_ms=9674.19, requests_per_s=1.601
+- max_profile_sharing: batches=4, mean_batch=4.00, p95_latency_ms=9782.45, requests_per_s=1.584
+- quantile_profile_sharing: batches=4, mean_batch=4.00, p95_latency_ms=9782.45, requests_per_s=1.584
+
+Artifacts:
+- prompts.jsonl
+- qaq_trace.jsonl
+- qaq_trace_summary.json
+- qaq_batching_simulation.json
+- manifest.txt
