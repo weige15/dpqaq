@@ -50,10 +50,7 @@ class DPLLM_Linear(nn.Module):
         if self.est_linear:
             self.lin_slope, self.lin_inter = est_params
         else:
-            self.register_buffer(
-                "jl",
-                est_params.to(dtype).to(device)
-            )
+            self.jl = est_params.to(dtype=dtype) if dtype is not None else est_params
         self.est_T = est_T
         self.b_l = b_l
         self.b_h = b_h
@@ -83,8 +80,12 @@ class DPLLM_Linear(nn.Module):
         
         # Use linear regression or JL
         if self.est_linear:
-            e = x_for_err.norm(dim=-1) * self.lin_slope + self.lin_inter
+            slope = self.lin_slope.to(x_for_err.device) if isinstance(self.lin_slope, torch.Tensor) else self.lin_slope
+            inter = self.lin_inter.to(x_for_err.device) if isinstance(self.lin_inter, torch.Tensor) else self.lin_inter
+            e = x_for_err.norm(dim=-1) * slope + inter
         else:
+            if self.jl.device != x_for_err.device or self.jl.dtype != x_for_err.dtype:
+                self.jl = self.jl.to(device=x_for_err.device, dtype=x_for_err.dtype)
             e = (x_for_err @ self.jl.T).norm(dim=-1)
         mask = e > self.est_T
 

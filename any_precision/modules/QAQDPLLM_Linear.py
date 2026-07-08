@@ -30,6 +30,9 @@ class QAQDPLLM_Linear(nn.Module):
             batch_policy="group",
             est_linear=None,
             est_params=None,
+            est_T=None,
+            b_l=None,
+            b_h=None,
     ):
         super().__init__()
         if dequant_kbit is None or matmul_kbit is None:
@@ -53,6 +56,8 @@ class QAQDPLLM_Linear(nn.Module):
         self.prefill_by_router = bool(prefill_by_router)
         self.batch_policy = batch_policy
         self.est_linear = est_linear
+        self.b_l = int(b_l) if b_l is not None else None
+        self.b_h = int(b_h) if b_h is not None else None
 
         object.__setattr__(self, "_router", router)
 
@@ -78,12 +83,17 @@ class QAQDPLLM_Linear(nn.Module):
         if est_linear is True:
             self.lin_slope, self.lin_inter = est_params
         elif est_linear is False and est_params is not None:
-            self.register_buffer("jl", est_params.to(dtype).to(device))
+            self.jl = est_params.to(dtype=dtype) if dtype is not None else est_params
         else:
             self.jl = None
 
+        self.est_T = torch.as_tensor(est_T, dtype=torch.float32) if est_T is not None else None
+
         self.comp_count = {bit: 0 for bit in self.precisions}
         self.fallback_count = 0
+        self.dp_guard_count = 0
+        self.dp_threshold_token_count = 0
+        self.dp_threshold_high_count = 0
         self.routed_token_count = 0
 
     @property
@@ -145,16 +155,19 @@ class QAQDPLLM_Linear(nn.Module):
             return self._fixed_precision_forward(x, self._min_valid_bit())
         if self.router_mode == "fixed_high":
             return self._fixed_precision_forward(x, self._max_valid_bit())
-        if self.router_mode not in {"mlp_binary", "mlp_multibit"}:
+        if self.router_mode not in {
+            "mlp_binary",
+            "mlp_multibit",
+            "dp_threshold_only",
+            "mlp_multibit_dp_guard",
+        }:
             raise RuntimeError(f"Unsupported QAQ router mode: {self.router_mode}")
-        if self.router is None:
+        if self.router_mode in {"mlp_binary", "mlp_multibit", "mlp_multibit_dp_guard"} and self.router is None:
             raise RuntimeError("MLP router mode requires a loaded QAQ router")
 
         original_shape = x.shape[:-1]
         flat_x = x.reshape(-1, x.shape[-1])
-        chosen_bits, fallback_count = self._choose_bits(flat_x)
-        self.fallback_count += int(fallback_count)
-        self.routed_token_count += int(flat_x.shape[0])
+        chosen_bits = self._choose_mode_bits(flat_x)
 
         if self.batch_policy == "max" and chosen_bits.numel() > 1:
             max_bit = int(chosen_bits.max().item())
@@ -188,9 +201,33 @@ class QAQDPLLM_Linear(nn.Module):
 
         return y_flat.reshape(*original_shape, self.out_features)
 
-    def _choose_bits(self, flat_x):
+    def _choose_mode_bits(self, flat_x):
+        if self.router_mode == "dp_threshold_only":
+            return self._choose_dp_threshold_bits(flat_x)
+
+        if self.router_mode in {"mlp_binary", "mlp_multibit"}:
+            chosen_bits, fallback_count = self._choose_router_bits(flat_x)
+            self.fallback_count += int(fallback_count)
+            self.routed_token_count += int(flat_x.shape[0])
+            return chosen_bits
+
+        if self.router_mode == "mlp_multibit_dp_guard":
+            estimated_error = self._estimated_error(flat_x)
+            router_bits, fallback_count = self._choose_router_bits(flat_x, estimated_error=estimated_error)
+            dp_bits = self._choose_dp_threshold_bits(flat_x, estimated_error=estimated_error)
+            chosen_bits = torch.maximum(router_bits, dp_bits)
+
+            self.fallback_count += int(fallback_count)
+            self.dp_guard_count += int((chosen_bits > router_bits).count_nonzero().item())
+            self.routed_token_count += int(flat_x.shape[0])
+            return chosen_bits
+
+        raise RuntimeError(f"Unsupported QAQ router mode: {self.router_mode}")
+
+    def _choose_router_bits(self, flat_x, estimated_error=None):
         self._ensure_router_device(flat_x.device)
-        estimated_error = self._estimated_error(flat_x) if self.router.use_estimated_error else None
+        if self.router.use_estimated_error and estimated_error is None:
+            estimated_error = self._estimated_error(flat_x)
 
         with torch.no_grad():
             logits = self.router(flat_x, self.route_id, estimated_error=estimated_error)
@@ -211,6 +248,25 @@ class QAQDPLLM_Linear(nn.Module):
             chosen_bits = self._clamp_to_valid_bits(chosen_bits)
             return chosen_bits, fallback_mask.count_nonzero().item()
 
+    def _choose_dp_threshold_bits(self, flat_x, estimated_error=None):
+        if self.b_l is None or self.b_h is None or self.est_T is None:
+            raise RuntimeError(
+                f"DP threshold mode for {self.route_name} requires b_l, b_h, and T_d threshold values."
+            )
+        if estimated_error is None:
+            estimated_error = self._estimated_error(flat_x)
+
+        threshold = self.est_T.to(device=flat_x.device, dtype=estimated_error.dtype)
+        high_mask = estimated_error > threshold
+        low = torch.full_like(high_mask, self.b_l, dtype=torch.long, device=flat_x.device)
+        high = torch.full_like(high_mask, self.b_h, dtype=torch.long, device=flat_x.device)
+        chosen_bits = torch.where(high_mask, high, low)
+        chosen_bits = self._clamp_to_valid_bits(chosen_bits)
+
+        self.dp_threshold_token_count += int(flat_x.shape[0])
+        self.dp_threshold_high_count += int(high_mask.count_nonzero().item())
+        return chosen_bits
+
     def _ensure_router_device(self, device):
         try:
             router_device = next(self.router.parameters()).device
@@ -221,8 +277,12 @@ class QAQDPLLM_Linear(nn.Module):
 
     def _estimated_error(self, flat_x):
         if self.est_linear is True:
-            return flat_x.norm(dim=-1) * self.lin_slope + self.lin_inter
+            slope = self.lin_slope.to(flat_x.device) if isinstance(self.lin_slope, torch.Tensor) else self.lin_slope
+            inter = self.lin_inter.to(flat_x.device) if isinstance(self.lin_inter, torch.Tensor) else self.lin_inter
+            return flat_x.norm(dim=-1) * slope + inter
         if self.est_linear is False and self.jl is not None:
+            if self.jl.device != flat_x.device or self.jl.dtype != flat_x.dtype:
+                self.jl = self.jl.to(device=flat_x.device, dtype=flat_x.dtype)
             return (flat_x @ self.jl.T).norm(dim=-1)
         raise RuntimeError(
             f"Router for {self.route_name} expects estimated-error features, "
@@ -253,6 +313,9 @@ class QAQDPLLM_Linear(nn.Module):
         for bit in self.comp_count.keys():
             self.comp_count[bit] = 0
         self.fallback_count = 0
+        self.dp_guard_count = 0
+        self.dp_threshold_token_count = 0
+        self.dp_threshold_high_count = 0
         self.routed_token_count = 0
 
     def extra_repr(self) -> str:

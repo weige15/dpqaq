@@ -75,6 +75,15 @@ model = QAQDPLLMForCausalLM.from_quantized(
 
 During prefill, the QAQ path uses max valid precision by default. During decoding, it routes each row independently. If a batch has mixed selected bits, rows are grouped by bit and computed with separate `matmul_kbit` calls.
 
+Runtime modes are:
+
+- `fixed_low` / `fixed_high`: force the lowest or highest valid precision.
+- `mlp_binary` / `mlp_multibit`: use the router prediction, with optional confidence fallback.
+- `dp_threshold_only`: use DP-LLM threshold logic from `T_d.pt`: choose `b_h` when the estimator error is above `T`, otherwise choose `b_l`.
+- `mlp_multibit_dp_guard`: choose the router bit, then apply `final_bit = max(router_bit, dp_bit)` using the DP threshold decision. Confidence fallback counts and DP guard trigger counts are reported separately.
+
+`dp_threshold_only` and `mlp_multibit_dp_guard` require `--estimator_results` containing `max_mem_dict.pt`, `linear_reg_d.pt`, `jl_d.pt`, and `T_d.pt`.
+
 Run generation sanity checks:
 
 ```bash

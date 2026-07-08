@@ -35,6 +35,7 @@ class QAQDPLLMForCausalLM(nn.Module):
             max_mem_dict=None,
             linear_reg_d=None,
             jl_d=None,
+            T_d=None,
             router_mode="mlp_multibit",
             confidence_threshold=None,
             fallback_bits=1,
@@ -53,10 +54,11 @@ class QAQDPLLMForCausalLM(nn.Module):
         max_mem_dict = max_mem_dict or {}
         linear_reg_d = linear_reg_d or {}
         jl_d = jl_d or {}
+        T_d = T_d or {}
 
         if router is None and router_checkpoint is not None:
             router, router_metadata = load_qaq_router_checkpoint(router_checkpoint)
-        if router is None and router_mode in {"mlp_binary", "mlp_multibit"}:
+        if router is None and router_mode in {"mlp_binary", "mlp_multibit", "mlp_multibit_dp_guard"}:
             raise ValueError("router_checkpoint or router is required for MLP QAQ modes")
         if router is not None and not isinstance(router, QAQRouter):
             raise TypeError("router must be a QAQRouter")
@@ -103,6 +105,7 @@ class QAQDPLLMForCausalLM(nn.Module):
             max_mem_dict=max_mem_dict,
             linear_reg_d=linear_reg_d,
             jl_d=jl_d,
+            T_d=T_d,
         )
 
         if self.router is not None and self.router.num_layers != len(self.route_map):
@@ -190,6 +193,7 @@ class QAQDPLLMForCausalLM(nn.Module):
             max_mem_dict=None,
             linear_reg_d=None,
             jl_d=None,
+            T_d=None,
             estimator_results=None,
             router_mode="mlp_multibit",
             confidence_threshold=None,
@@ -201,12 +205,15 @@ class QAQDPLLMForCausalLM(nn.Module):
             linear_reg_path = os.path.join(estimator_results, "linear_reg_d.pt")
             jl_path = os.path.join(estimator_results, "jl_d.pt")
             max_mem_path = os.path.join(estimator_results, "max_mem_dict.pt")
+            T_path = os.path.join(estimator_results, "T_d.pt")
             if linear_reg_d is None and os.path.exists(linear_reg_path):
                 linear_reg_d = torch.load(linear_reg_path, map_location="cpu", weights_only=False)
             if jl_d is None and os.path.exists(jl_path):
                 jl_d = torch.load(jl_path, map_location="cpu", weights_only=False)
             if max_mem_dict is None and os.path.exists(max_mem_path):
                 max_mem_dict = torch.load(max_mem_path, map_location="cpu", weights_only=False)
+            if T_d is None and os.path.exists(T_path):
+                T_d = torch.load(T_path, map_location="cpu", weights_only=False)
 
         config = cls._load_config(quant_model_path, trust_remote_code)
         return cls(
@@ -222,6 +229,7 @@ class QAQDPLLMForCausalLM(nn.Module):
             max_mem_dict=max_mem_dict,
             linear_reg_d=linear_reg_d,
             jl_d=jl_d,
+            T_d=T_d,
             router_mode=router_mode,
             confidence_threshold=confidence_threshold,
             fallback_bits=fallback_bits,
@@ -229,10 +237,12 @@ class QAQDPLLMForCausalLM(nn.Module):
             batch_policy=batch_policy,
         )
 
-    def _load_quantized_modules(self, dtype=torch.float16, max_mem_dict=None, linear_reg_d=None, jl_d=None):
+    def _load_quantized_modules(self, dtype=torch.float16, max_mem_dict=None, linear_reg_d=None, jl_d=None, T_d=None):
         max_mem_dict = max_mem_dict or {}
         linear_reg_d = linear_reg_d or {}
         jl_d = jl_d or {}
+        T_d = T_d or {}
+        requires_dp_threshold = self.router_mode in {"dp_threshold_only", "mlp_multibit_dp_guard"}
         layers = self.analyzer.get_layers()
 
         route_id = 0
@@ -246,7 +256,19 @@ class QAQDPLLMForCausalLM(nn.Module):
                 if (layer_i, real_name) not in max_mem_dict:
                     max_mem_dict[(layer_i, real_name)] = max(self.precisions)
 
-                est_linear, est_params = self._estimator_params(layer_i, real_name, linear_reg_d, jl_d)
+                est_linear, est_params = self._estimator_params(
+                    layer_i,
+                    real_name,
+                    linear_reg_d,
+                    jl_d,
+                    required=requires_dp_threshold,
+                )
+                b_l, b_h, est_T = self._threshold_params(
+                    layer_i,
+                    real_name,
+                    T_d,
+                    required=requires_dp_threshold,
+                )
 
                 wqlinear = QAQDPLLM_Linear(
                     module.in_features,
@@ -267,6 +289,9 @@ class QAQDPLLMForCausalLM(nn.Module):
                     batch_policy=self.batch_policy,
                     est_linear=est_linear,
                     est_params=est_params,
+                    est_T=est_T,
+                    b_l=b_l,
+                    b_h=b_h,
                 )
                 self.ap_linears.append(wqlinear)
                 self.route_map.append({
@@ -282,18 +307,30 @@ class QAQDPLLMForCausalLM(nn.Module):
             torch.cuda.empty_cache()
             gc.collect()
 
-    def _estimator_params(self, layer_i, real_name, linear_reg_d, jl_d):
-        if self.router is None or not self.router.use_estimated_error:
-            return None, None
-        if (layer_i, real_name) in linear_reg_d:
-            lin_params = linear_reg_d[(layer_i, real_name)]
+    def _estimator_params(self, layer_i, real_name, linear_reg_d, jl_d, required=False):
+        key = (layer_i, real_name)
+        if key in linear_reg_d:
+            lin_params = linear_reg_d[key]
             return True, (lin_params[0], lin_params[1])
-        if (layer_i, real_name) in jl_d:
-            return False, jl_d[(layer_i, real_name)]
-        raise RuntimeError(
-            f"Router checkpoint expects estimated-error features, but no estimator "
-            f"parameters were provided for layer {layer_i} linear {real_name}."
-        )
+        if key in jl_d:
+            return False, jl_d[key]
+        if required or (self.router is not None and self.router.use_estimated_error):
+            raise RuntimeError(
+                f"QAQ mode expects DP-style estimator parameters, but none were "
+                f"provided for layer {layer_i} linear {real_name}."
+            )
+        return None, None
+
+    def _threshold_params(self, layer_i, real_name, T_d, required=False):
+        key = (layer_i, real_name)
+        if key in T_d:
+            b_l, b_h, est_T = T_d[key]
+            return int(b_l), int(b_h), est_T
+        if required:
+            raise RuntimeError(
+                f"DP threshold mode requires T_d values for layer {layer_i} linear {real_name}."
+            )
+        return None, None, None
 
     def get_effective_bits(self):
         total_bits = 0
@@ -315,26 +352,45 @@ class QAQDPLLMForCausalLM(nn.Module):
         total_tokens = 0
         total_selected_bits = 0
         total_fallbacks = 0
+        total_dp_guard_triggers = 0
+        total_dp_threshold_tokens = 0
+        total_dp_threshold_high = 0
         per_layer = {}
 
         for linear in self.ap_linears:
             route_total = sum(linear.comp_count.values())
             bit_counts = {str(bit): int(count) for bit, count in linear.comp_count.items()}
+            dp_guard_count = getattr(linear, "dp_guard_count", 0)
+            dp_threshold_token_count = getattr(linear, "dp_threshold_token_count", 0)
+            dp_threshold_high_count = getattr(linear, "dp_threshold_high_count", 0)
             per_layer[linear.route_name] = {
                 "bit_counts": bit_counts,
                 "fallback_count": int(linear.fallback_count),
+                "dp_guard_trigger_count": int(dp_guard_count),
+                "dp_threshold_token_count": int(dp_threshold_token_count),
+                "dp_threshold_high_count": int(dp_threshold_high_count),
                 "routed_token_count": int(linear.routed_token_count),
             }
             total_tokens += route_total
             total_selected_bits += sum(bit * count for bit, count in linear.comp_count.items())
             total_fallbacks += linear.fallback_count
+            total_dp_guard_triggers += dp_guard_count
+            total_dp_threshold_tokens += dp_threshold_token_count
+            total_dp_threshold_high += dp_threshold_high_count
 
         return {
             "average_selected_bit": total_selected_bits / total_tokens if total_tokens > 0 else 0,
             "effective_bits": self.get_effective_bits(),
             "fallback_fraction": total_fallbacks / total_tokens if total_tokens > 0 else 0,
+            "dp_guard_trigger_fraction": total_dp_guard_triggers / total_tokens if total_tokens > 0 else 0,
+            "dp_threshold_high_fraction": (
+                total_dp_threshold_high / total_dp_threshold_tokens if total_dp_threshold_tokens > 0 else 0
+            ),
             "total_tokens": int(total_tokens),
             "total_fallbacks": int(total_fallbacks),
+            "total_dp_guard_triggers": int(total_dp_guard_triggers),
+            "total_dp_threshold_tokens": int(total_dp_threshold_tokens),
+            "total_dp_threshold_high": int(total_dp_threshold_high),
             "per_layer": per_layer,
         }
 

@@ -167,3 +167,4 @@ cache/
 
 # Evaluate directories
 any_precision/evaluate/input_tokens_cache/
+*.pt
