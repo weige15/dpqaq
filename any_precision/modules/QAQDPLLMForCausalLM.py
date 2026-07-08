@@ -113,6 +113,11 @@ class QAQDPLLMForCausalLM(nn.Module):
                 f"Router checkpoint has {self.router.num_layers} routes, "
                 f"but this model exposes {len(self.route_map)} quantized linear routes."
             )
+        if self.router is not None:
+            if "route_map" in self.router_metadata:
+                self._validate_router_route_map(self.router_metadata["route_map"], self.route_map)
+            elif router_checkpoint is not None:
+                raise ValueError("Router checkpoint is missing route_map; cannot validate route order.")
 
         self.tie_weights()
 
@@ -306,6 +311,42 @@ class QAQDPLLMForCausalLM(nn.Module):
 
             torch.cuda.empty_cache()
             gc.collect()
+
+    @staticmethod
+    def _route_identity(route):
+        required_fields = ("route_id", "layer", "parent", "name")
+        missing = [field for field in required_fields if field not in route]
+        if missing:
+            raise ValueError(f"Router checkpoint route_map entry is missing fields: {missing}")
+
+        layer = int(route["layer"])
+        name = str(route["name"])
+        return {
+            "route_id": int(route["route_id"]),
+            "layer": layer,
+            "parent": str(route["parent"]),
+            "name": name,
+            "route_name": str(route.get("route_name", f"{layer}.{name}")),
+        }
+
+    @classmethod
+    def _validate_router_route_map(cls, checkpoint_route_map, runtime_route_map):
+        if not checkpoint_route_map:
+            raise ValueError("Router checkpoint route_map is empty; cannot validate route order.")
+        if len(checkpoint_route_map) != len(runtime_route_map):
+            raise ValueError(
+                f"Router checkpoint route_map has {len(checkpoint_route_map)} routes, "
+                f"but this model exposes {len(runtime_route_map)} routes."
+            )
+
+        for idx, (checkpoint_route, runtime_route) in enumerate(zip(checkpoint_route_map, runtime_route_map)):
+            checkpoint_identity = cls._route_identity(checkpoint_route)
+            runtime_identity = cls._route_identity(runtime_route)
+            if checkpoint_identity != runtime_identity:
+                raise ValueError(
+                    "Router checkpoint route_map mismatch at route index "
+                    f"{idx}: checkpoint has {checkpoint_identity}, runtime has {runtime_identity}."
+                )
 
     def _estimator_params(self, layer_i, real_name, linear_reg_d, jl_d, required=False):
         key = (layer_i, real_name)

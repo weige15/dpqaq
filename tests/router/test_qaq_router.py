@@ -14,6 +14,7 @@ from any_precision.modules.QAQRouter import (
     load_qaq_router_checkpoint,
     save_qaq_router_checkpoint,
 )
+from any_precision.modules.QAQDPLLMForCausalLM import QAQDPLLMForCausalLM
 import scripts.train_qaq_router as train_qaq_router
 
 
@@ -116,6 +117,48 @@ def test_checkpoint_save_load_roundtrip(tmp_path):
     assert metadata["error_threshold"] == 0.01
     assert metadata["target_bits"] == 4.5
     torch.testing.assert_close(actual_logits, expected_logits)
+
+
+def test_route_map_validation_accepts_matching_identity_with_extra_metadata():
+    checkpoint_route_map = [
+        {
+            "route_id": 0,
+            "layer": 0,
+            "parent": "self_attn",
+            "name": "q_proj",
+            "route_name": "0.q_proj",
+            "in_features": 4,
+            "out_features": 8,
+        },
+        {"route_id": 1, "layer": 0, "parent": "self_attn", "name": "k_proj"},
+    ]
+    runtime_route_map = [
+        {"route_id": 0, "layer": 0, "parent": "self_attn", "name": "q_proj", "route_name": "0.q_proj"},
+        {"route_id": 1, "layer": 0, "parent": "self_attn", "name": "k_proj", "route_name": "0.k_proj"},
+    ]
+
+    QAQDPLLMForCausalLM._validate_router_route_map(checkpoint_route_map, runtime_route_map)
+
+
+def test_route_map_validation_rejects_mismatched_route_order():
+    checkpoint_route_map = [
+        {"route_id": 0, "layer": 0, "parent": "self_attn", "name": "q_proj", "route_name": "0.q_proj"},
+    ]
+    runtime_route_map = [
+        {"route_id": 0, "layer": 0, "parent": "self_attn", "name": "k_proj", "route_name": "0.k_proj"},
+    ]
+
+    with pytest.raises(ValueError, match="route_map mismatch at route index 0"):
+        QAQDPLLMForCausalLM._validate_router_route_map(checkpoint_route_map, runtime_route_map)
+
+
+def test_route_map_validation_rejects_empty_checkpoint_map():
+    runtime_route_map = [
+        {"route_id": 0, "layer": 0, "parent": "self_attn", "name": "q_proj", "route_name": "0.q_proj"},
+    ]
+
+    with pytest.raises(ValueError, match="route_map is empty"):
+        QAQDPLLMForCausalLM._validate_router_route_map([], runtime_route_map)
 
 
 def test_duplicate_bits_are_rejected():
