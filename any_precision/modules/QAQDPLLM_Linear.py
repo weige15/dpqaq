@@ -1,4 +1,6 @@
 import warnings
+import time
+from contextlib import contextmanager
 
 import torch
 import torch.nn as nn
@@ -7,6 +9,9 @@ try:
     from any_precision_ext import matmul_kbit, dequant_kbit
 except:
     matmul_kbit, dequant_kbit = None, None
+
+
+_PHASE_TIMING_KEYS = ("router", "estimator", "grouping", "dequant_matmul", "total")
 
 
 class QAQDPLLM_Linear(nn.Module):
@@ -95,6 +100,8 @@ class QAQDPLLM_Linear(nn.Module):
         self.dp_threshold_token_count = 0
         self.dp_threshold_high_count = 0
         self.routed_token_count = 0
+        self.phase_timing_enabled = False
+        self.clear_phase_timing()
 
     @property
     def router(self):
@@ -109,15 +116,21 @@ class QAQDPLLM_Linear(nn.Module):
         self.comp_count = {bit: self.comp_count.get(bit, 0) for bit in self.precisions}
 
     def forward(self, x, **kwargs):
-        if self._is_prefill(x) and not self.prefill_by_router:
-            y = self._fixed_precision_forward(x, self._max_valid_bit())
+        if self._should_time_phases(x):
+            with self._record_phase("total", x):
+                y = self._forward_without_bias(x)
         else:
-            y = self._router_forward(x)
+            y = self._forward_without_bias(x)
 
         if self.bias is not None:
             y += self.bias
 
         return y
+
+    def _forward_without_bias(self, x):
+        if self._is_prefill(x) and not self.prefill_by_router:
+            return self._fixed_precision_forward(x, self._max_valid_bit())
+        return self._router_forward(x)
 
     def _is_prefill(self, x):
         if x.dim() >= 3:
@@ -187,17 +200,23 @@ class QAQDPLLM_Linear(nn.Module):
             device=x.device,
         )
 
-        for bit in sorted(set(chosen_bits.detach().cpu().tolist())):
-            mask = chosen_bits == bit
-            rows = flat_x[mask].contiguous()
+        with self._record_phase("grouping", flat_x):
+            selected_bits = sorted(set(chosen_bits.detach().cpu().tolist()))
+
+        for bit in selected_bits:
+            with self._record_phase("grouping", flat_x):
+                mask = chosen_bits == bit
+                rows = flat_x[mask].contiguous()
+                row_count = int(mask.count_nonzero().item())
             if rows.numel() == 0:
                 continue
-            if rows.shape[0] > 8:
-                weight = dequant_kbit(self.qweight, self._buffers[f'lut{bit}'], bit)
-                y_flat[mask] = torch.matmul(rows, weight.T)
-            else:
-                y_flat[mask] = matmul_kbit(rows, self.qweight, self._buffers[f'lut{bit}'], bit)
-            self.comp_count[bit] += int(mask.count_nonzero().item())
+            with self._record_phase("dequant_matmul", flat_x):
+                if rows.shape[0] > 8:
+                    weight = dequant_kbit(self.qweight, self._buffers[f'lut{bit}'], bit)
+                    y_flat[mask] = torch.matmul(rows, weight.T)
+                else:
+                    y_flat[mask] = matmul_kbit(rows, self.qweight, self._buffers[f'lut{bit}'], bit)
+            self.comp_count[bit] += row_count
 
         return y_flat.reshape(*original_shape, self.out_features)
 
@@ -212,8 +231,10 @@ class QAQDPLLM_Linear(nn.Module):
             return chosen_bits
 
         if self.router_mode == "mlp_multibit_dp_guard":
-            estimated_error = self._estimated_error(flat_x)
-            router_bits, fallback_count = self._choose_router_bits(flat_x, estimated_error=estimated_error)
+            with self._record_phase("estimator", flat_x):
+                estimated_error = self._estimated_error(flat_x)
+            with self._record_phase("router", flat_x):
+                router_bits, fallback_count = self._choose_router_bits(flat_x, estimated_error=estimated_error)
             dp_bits = self._choose_dp_threshold_bits(flat_x, estimated_error=estimated_error)
             chosen_bits = torch.maximum(router_bits, dp_bits)
 
@@ -317,6 +338,75 @@ class QAQDPLLM_Linear(nn.Module):
         self.dp_threshold_token_count = 0
         self.dp_threshold_high_count = 0
         self.routed_token_count = 0
+        self.clear_phase_timing()
+
+    def set_phase_timing_enabled(self, enabled=True):
+        self.phase_timing_enabled = bool(enabled)
+
+    def clear_phase_timing(self):
+        self._phase_wall_time_s = {key: 0.0 for key in _PHASE_TIMING_KEYS}
+        self._phase_cuda_time_s = {key: 0.0 for key in _PHASE_TIMING_KEYS}
+        self._phase_count = {key: 0 for key in _PHASE_TIMING_KEYS}
+        self._phase_cuda_events = []
+
+    def get_phase_timing_stats(self):
+        self._flush_phase_timing()
+        return {
+            key: {
+                "wall_time_s": float(self._phase_wall_time_s[key]),
+                "cuda_time_s": float(self._phase_cuda_time_s[key]),
+                "count": int(self._phase_count[key]),
+                "mean_wall_ms": (
+                    1000.0 * self._phase_wall_time_s[key] / self._phase_count[key]
+                    if self._phase_count[key] > 0 else 0.0
+                ),
+                "mean_cuda_ms": (
+                    1000.0 * self._phase_cuda_time_s[key] / self._phase_count[key]
+                    if self._phase_count[key] > 0 else 0.0
+                ),
+            }
+            for key in _PHASE_TIMING_KEYS
+        }
+
+    def _should_time_phases(self, x):
+        return (
+            self.phase_timing_enabled
+            and self.router_mode == "mlp_multibit_dp_guard"
+            and not (self._is_prefill(x) and not self.prefill_by_router)
+        )
+
+    @contextmanager
+    def _record_phase(self, phase, reference_tensor):
+        if not self._should_time_phases(reference_tensor):
+            yield
+            return
+
+        wall_start = time.perf_counter()
+        use_cuda_events = torch.cuda.is_available() and reference_tensor.device.type == "cuda"
+        start_event = None
+        end_event = None
+        if use_cuda_events:
+            stream = torch.cuda.current_stream(reference_tensor.device)
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+            start_event.record(stream)
+
+        try:
+            yield
+        finally:
+            if use_cuda_events:
+                end_event.record(torch.cuda.current_stream(reference_tensor.device))
+                self._phase_cuda_events.append((phase, start_event, end_event))
+            self._phase_wall_time_s[phase] += time.perf_counter() - wall_start
+            self._phase_count[phase] += 1
+
+    def _flush_phase_timing(self):
+        if not self._phase_cuda_events:
+            return
+        for phase, start_event, end_event in self._phase_cuda_events:
+            end_event.synchronize()
+            self._phase_cuda_time_s[phase] += start_event.elapsed_time(end_event) / 1000.0
+        self._phase_cuda_events = []
 
     def extra_repr(self) -> str:
         return (

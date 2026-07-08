@@ -1,0 +1,19 @@
+date=2026-07-09T00:32:00+08:00
+commit=a9a3f44f68fc487f5ebf9a7c5fb5cfb68d02b945
+note=run used dirty worktree with QAQDPLLM_Linear phase timer changes
+cuda_visible_devices=0
+gpu=0 NVIDIA GeForce RTX 3090 24576 MiB
+ap_model_path=/nfs/home/s314511048/dpqaq/cache/packed/anyprec-(Meta-Llama-3.1-8B)-w6_orig3-gc1-c4_s100_blk512
+router_checkpoint=./checkpoints/qaq_router_llama31_8b_th005.pt
+estimator_results=./estimator_private_values/anyprec-(Meta-Llama-3.1-8B)-w6_orig3-gc1-c4_s100_blk512/finetuned_max6.0_3b-6b_th_pb_train_0.01_1.0_1ep_targ4.5b_init_0-40_adam
+bits=3 4 5 6
+mode=mlp_multibit_dp_guard
+warmup=1
+repeat=1
+max_new_tokens=4
+prompt=Explain mixed-precision inference in one sentence.
+confidence_threshold=0.6
+output_json=artifacts/qaq_phase_timers_20260709_0032/benchmark.json
+
+command:
+CUDA_VISIBLE_DEVICES=0 python scripts/benchmark_qaq_modes.py --ap_model_path /nfs/home/s314511048/dpqaq/cache/packed/anyprec-\(Meta-Llama-3.1-8B\)-w6_orig3-gc1-c4_s100_blk512 --router_checkpoint ./checkpoints/qaq_router_llama31_8b_th005.pt --estimator_results ./estimator_private_values/anyprec-\(Meta-Llama-3.1-8B\)-w6_orig3-gc1-c4_s100_blk512/finetuned_max6.0_3b-6b_th_pb_train_0.01_1.0_1ep_targ4.5b_init_0-40_adam --bits 3 4 5 6 --modes mlp_multibit_dp_guard --prompt "Explain mixed-precision inference in one sentence." --max_new_tokens 4 --warmup 1 --repeat 1 --device cuda --confidence_threshold 0.6 --output_json artifacts/qaq_phase_timers_20260709_0032/benchmark.json

@@ -356,6 +356,7 @@ class QAQDPLLMForCausalLM(nn.Module):
         total_dp_threshold_tokens = 0
         total_dp_threshold_high = 0
         per_layer = {}
+        phase_timing_totals = {}
 
         for linear in self.ap_linears:
             route_total = sum(linear.comp_count.values())
@@ -363,7 +364,7 @@ class QAQDPLLMForCausalLM(nn.Module):
             dp_guard_count = getattr(linear, "dp_guard_count", 0)
             dp_threshold_token_count = getattr(linear, "dp_threshold_token_count", 0)
             dp_threshold_high_count = getattr(linear, "dp_threshold_high_count", 0)
-            per_layer[linear.route_name] = {
+            layer_stats = {
                 "bit_counts": bit_counts,
                 "fallback_count": int(linear.fallback_count),
                 "dp_guard_trigger_count": int(dp_guard_count),
@@ -371,6 +372,20 @@ class QAQDPLLMForCausalLM(nn.Module):
                 "dp_threshold_high_count": int(dp_threshold_high_count),
                 "routed_token_count": int(linear.routed_token_count),
             }
+
+            if hasattr(linear, "get_phase_timing_stats"):
+                phase_timing = linear.get_phase_timing_stats()
+                if any(stats["count"] > 0 for stats in phase_timing.values()):
+                    layer_stats["phase_timing"] = phase_timing
+                    for phase, stats in phase_timing.items():
+                        total = phase_timing_totals.setdefault(
+                            phase, {"wall_time_s": 0.0, "cuda_time_s": 0.0, "count": 0}
+                        )
+                        total["wall_time_s"] += float(stats["wall_time_s"])
+                        total["cuda_time_s"] += float(stats["cuda_time_s"])
+                        total["count"] += int(stats["count"])
+
+            per_layer[linear.route_name] = layer_stats
             total_tokens += route_total
             total_selected_bits += sum(bit * count for bit, count in linear.comp_count.items())
             total_fallbacks += linear.fallback_count
@@ -378,7 +393,7 @@ class QAQDPLLMForCausalLM(nn.Module):
             total_dp_threshold_tokens += dp_threshold_token_count
             total_dp_threshold_high += dp_threshold_high_count
 
-        return {
+        stats = {
             "average_selected_bit": total_selected_bits / total_tokens if total_tokens > 0 else 0,
             "effective_bits": self.get_effective_bits(),
             "fallback_fraction": total_fallbacks / total_tokens if total_tokens > 0 else 0,
@@ -393,6 +408,28 @@ class QAQDPLLMForCausalLM(nn.Module):
             "total_dp_threshold_high": int(total_dp_threshold_high),
             "per_layer": per_layer,
         }
+        if phase_timing_totals:
+            stats["phase_timing"] = self._summarize_phase_timing(phase_timing_totals)
+        return stats
+
+    @staticmethod
+    def _summarize_phase_timing(phase_timing_totals):
+        return {
+            phase: {
+                "wall_time_s": float(values["wall_time_s"]),
+                "cuda_time_s": float(values["cuda_time_s"]),
+                "count": int(values["count"]),
+                "mean_wall_ms": (
+                    1000.0 * values["wall_time_s"] / values["count"]
+                    if values["count"] > 0 else 0.0
+                ),
+                "mean_cuda_ms": (
+                    1000.0 * values["cuda_time_s"] / values["count"]
+                    if values["count"] > 0 else 0.0
+                ),
+            }
+            for phase, values in phase_timing_totals.items()
+        }
 
     def clear_comp_count(self):
         for linear in self.ap_linears:
@@ -400,6 +437,11 @@ class QAQDPLLMForCausalLM(nn.Module):
 
     def clear_router_stats(self):
         self.clear_comp_count()
+
+    def set_phase_timing_enabled(self, enabled=True):
+        for linear in self.ap_linears:
+            if hasattr(linear, "set_phase_timing_enabled"):
+                linear.set_phase_timing_enabled(enabled)
 
     def prune_precisions(self):
         for ap_linear in self.ap_linears:

@@ -1,0 +1,6 @@
+date=2026-07-08T22:55:44+08:00
+commit=681beb1ec2756c335d68e13e0073694ee1da3426
+dirty_status:
+?? artifacts/qaq_dp_guard_postcommit_20260708_225544/
+
+baseline_artifact=artifacts/qaq_dp_guard_sanity_20260708_223930

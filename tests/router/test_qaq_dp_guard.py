@@ -109,6 +109,37 @@ def test_mlp_multibit_dp_guard_raises_router_bit_and_counts_separately(monkeypat
     assert linear.dp_threshold_high_count == 1
 
 
+def test_mlp_multibit_dp_guard_phase_timers_report_and_clear(monkeypatch):
+    install_fake_kernels(monkeypatch)
+    linear = make_threshold_linear(
+        router=StaticRouter(),
+        router_mode="mlp_multibit_dp_guard",
+        confidence_threshold=0.9,
+    )
+    linear.set_phase_timing_enabled(True)
+
+    linear(threshold_inputs().flip(0))
+
+    timing = linear.get_phase_timing_stats()
+    for phase in ["router", "estimator", "grouping", "dequant_matmul", "total"]:
+        assert timing[phase]["count"] > 0
+        assert timing[phase]["wall_time_s"] >= 0
+    assert timing["total"]["count"] == 1
+
+    model = QAQDPLLMForCausalLM.__new__(QAQDPLLMForCausalLM)
+    model.ap_linears = [linear]
+    stats = QAQDPLLMForCausalLM.get_router_stats(model)
+
+    assert "phase_timing" in stats
+    assert stats["phase_timing"]["router"]["count"] == timing["router"]["count"]
+    assert stats["per_layer"]["0.q_proj"]["phase_timing"]["total"]["count"] == 1
+
+    linear.clear_stats()
+
+    cleared = linear.get_phase_timing_stats()
+    assert all(phase_stats["count"] == 0 for phase_stats in cleared.values())
+
+
 def test_from_quantized_loads_t_d_from_estimator_results(monkeypatch, tmp_path):
     expected_T_d = {(0, "q_proj"): (3, 6, torch.tensor(1.0))}
     expected_linear_reg_d = {(0, "q_proj"): (torch.tensor(1.0), torch.tensor(0.0))}
