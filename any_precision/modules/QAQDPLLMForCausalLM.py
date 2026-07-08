@@ -374,20 +374,14 @@ class QAQDPLLMForCausalLM(nn.Module):
         return None, None, None
 
     def get_effective_bits(self):
-        total_bits = 0
-        total_comps = 0
+        total_weighted_bits = 0
+        total_weighted_comps = 0
         for linear in self.ap_linears:
-            total_comps_temp = 0
-            for bits in linear.comp_count.keys():
-                comp = linear.comp_count[bits]
-                total_bits += (comp * bits) * (linear.in_features * linear.out_features)
-                total_comps_temp += comp
-            if total_comps == 0:
-                total_comps = total_comps_temp
-        total_params = 0
-        for linear in self.ap_linears:
-            total_params += (linear.in_features * linear.out_features)
-        return total_bits / (total_params * total_comps) if total_comps > 0 else 0
+            param_count = linear.in_features * linear.out_features
+            for bit, comp in linear.comp_count.items():
+                total_weighted_bits += comp * bit * param_count
+                total_weighted_comps += comp * param_count
+        return total_weighted_bits / total_weighted_comps if total_weighted_comps > 0 else 0
 
     def get_router_stats(self):
         total_tokens = 0

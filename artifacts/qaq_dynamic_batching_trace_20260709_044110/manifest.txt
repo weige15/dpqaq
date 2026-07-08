@@ -1,0 +1,46 @@
+QAQ dynamic batching trace collection run
+
+Status:
+- Real QAQ generation trace collection: COMPLETE
+- Dynamic batching validation: UNVALIDATED
+- Quality validation: UNVALIDATED
+- Finite-logit check: UNVALIDATED (not requested for this run)
+- Transfer/kernel-switch metrics: UNVALIDATED
+
+Environment:
+- CUDA_VISIBLE_DEVICES=0
+- GPU: NVIDIA GeForce RTX 3090
+- AP_MODEL_PATH=/nfs/home/s314511048/dpqaq/cache/packed/anyprec-(Meta-Llama-3.1-8B)-w6_orig3-gc1-c4_s100_blk512
+- Router checkpoint: checkpoints/qaq_router_llama31_8b_th005.pt
+- Estimator results: estimator_private_values/anyprec-(Meta-Llama-3.1-8B)-w6_orig3-gc1-c4_s100_blk512/finetuned_max6.0_3b-6b_th_pb_train_0.01_1.0_1ep_targ4.5b_init_0-40_adam
+
+Command:
+CUDA_VISIBLE_DEVICES=0 python scripts/collect_qaq_profile_traces.py \
+  --ap_model_path "$AP_MODEL_PATH" \
+  --router_checkpoint checkpoints/qaq_router_llama31_8b_th005.pt \
+  --estimator_results 'estimator_private_values/anyprec-(Meta-Llama-3.1-8B)-w6_orig3-gc1-c4_s100_blk512/finetuned_max6.0_3b-6b_th_pb_train_0.01_1.0_1ep_targ4.5b_init_0-40_adam' \
+  --bits 3 4 5 6 \
+  --router_mode mlp_multibit_dp_guard \
+  --prompt_file artifacts/qaq_dynamic_batching_trace_20260709_044110/prompts.jsonl \
+  --max_requests 4 \
+  --workload_type manual_mixed \
+  --max_new_tokens 16 \
+  --device cuda \
+  --output_jsonl artifacts/qaq_dynamic_batching_trace_20260709_044110/qaq_trace.jsonl \
+  --summary_json artifacts/qaq_dynamic_batching_trace_20260709_044110/qaq_trace_summary.json
+
+Validation summary:
+- record_count: 4
+- schema_version: qaq_dynamic_batching_trace_v1
+- request_ids: manual_chat_000, manual_math_000, manual_code_000, manual_summary_000
+- average_selected_bit: 5.496, 5.678, 5.625, 5.704
+- effective_bits: 5.438, 5.656, 5.561, 5.667
+- fallback_count: 0, 0, 0, 0
+- dp_guard_trigger_count: 81, 74, 61, 86
+- end_to_end_latency_ms: 4390.40, 3967.50, 3931.60, 3933.19
+
+Artifacts:
+- prompts.jsonl
+- qaq_trace.jsonl
+- qaq_trace_summary.json
+- manifest.txt

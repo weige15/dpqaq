@@ -199,6 +199,16 @@ def test_router_stats_reports_fallback_and_dp_guard_counts_separately():
     assert stats["per_layer"]["0.q_proj"]["dp_guard_trigger_count"] == 1
 
 
+def test_effective_bits_weights_each_linear_by_own_param_and_compute_count():
+    model = QAQDPLLMForCausalLM.__new__(QAQDPLLMForCausalLM)
+    model.ap_linears = [
+        SimpleNamespace(comp_count={3: 2, 6: 0}, in_features=2, out_features=2),
+        SimpleNamespace(comp_count={3: 0, 6: 1}, in_features=1, out_features=4),
+    ]
+
+    assert QAQDPLLMForCausalLM.get_effective_bits(model) == 4.0
+
+
 def test_estimator_tensors_are_not_meta_buffers_under_empty_init(monkeypatch):
     from accelerate.big_modeling import init_empty_weights
 
