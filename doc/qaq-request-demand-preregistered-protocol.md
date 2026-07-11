@@ -103,17 +103,20 @@ for that length cell. Do not pad, wrap, or borrow tokens from another document.
 
 ## Request Counts And Length Grid
 
-Collect **576 requests per dataset**, 1,152 total, allocated as follows.
+Collect **256 requests per dataset**, 512 total, allocated as follows. This is a
+pre-run feasibility amendment recorded in Deviations: WikiText-2 test contains
+only 62 nonempty source articles and cannot supply the original 576 requests
+while preserving document isolation, nonoverlap, and 128-token gaps.
 
 | Prompt tokens | Continuation tokens | Development | Calibration | Confirmatory test | Per dataset |
 | ---: | ---: | ---: | ---: | ---: | ---: |
-| 128 | 32 | 64 | 16 | 64 | 144 |
-| 128 | 128 | 64 | 16 | 64 | 144 |
-| 512 | 32 | 64 | 16 | 64 | 144 |
-| 512 | 128 | 64 | 16 | 64 | 144 |
-| **Total** | | **256** | **64** | **256** | **576** |
+| 128 | 32 | 32 | 8 | 24 | 64 |
+| 128 | 128 | 32 | 8 | 24 | 64 |
+| 512 | 32 | 32 | 8 | 24 | 64 |
+| 512 | 128 | 32 | 8 | 24 | 64 |
+| **Total** | | **128** | **32** | **96** | **256** |
 
-Thus each dataset has at least 256 requests overall and exactly 256 untouched
+Thus each dataset has exactly 256 requests overall and 96 untouched
 confirmatory requests. Continuation tokens are real held-out tokens from the
 same document. They are used for teacher-forced quality and observed-profile
 targets, never as predictor inputs.
@@ -139,7 +142,7 @@ The split unit is the source document, never a token window.
 6. Within each dataset, partition, and length cell, sort candidates by
    `sha256(document_id || start_token || prompt_length || continuation_length)`
    and take the first candidates meeting the quota.
-7. Cap contribution at eight requests per document per partition and at two per
+7. Cap contribution at 16 requests per document per partition and at four per
    length cell. If a quota cannot be filled, the protocol is `NOT COMPLETE`;
    do not relax the split or duplicate requests.
 
@@ -222,10 +225,10 @@ The primary predictor family is the repository's random forest with 300 trees,
 `min_samples_leaf=2`, balanced class weights for classification, and no
 post-registration hyperparameter search. Run predictor seeds **17, 29, and 43**.
 
-- Training: pooled WikiText-2 and C4 development documents (512 requests).
-- Calibration: pooled calibration documents (128 requests), used only to choose
+- Training: pooled WikiText-2 and C4 development documents (256 requests).
+- Calibration: pooled calibration documents (64 requests), used only to choose
   uncertainty cutoffs and map predictions to scheduler lanes.
-- Test: each dataset's 256 test requests, reported separately and pooled.
+- Test: each dataset's 96 test requests, reported separately and pooled.
 - Internal development estimates: five grouped folds by document. These are
   diagnostic and cannot replace final test metrics.
 - Constant baselines: training-partition majority safe bit, training mean
@@ -271,7 +274,7 @@ reported by output length and token-hash, not suppressed.
 
 ## Scheduler Workload
 
-Scheduler evaluation uses only the 256 confirmatory requests from one dataset
+Scheduler evaluation uses only the 96 confirmatory requests from one dataset
 at a time. Run scheduling seeds **101, 202, and 303**. Each seed deterministically
 permutes requests within length cells and generates exponential inter-arrival
 times.
@@ -457,7 +460,15 @@ artifact should be committed. Store hashes and documented external paths.
 
 ## Deviations
 
-At preregistration time: **none**.
+Pre-run feasibility amendment, 2026-07-11: before any new model result was
+collected, dataset inspection found 62 nonempty WikiText-2 test articles. The
+original 576-request allocation was infeasible under the registered
+document-isolation, nonoverlap, 128-token-gap, and eight-request-per-document
+constraints. The allocation is amended to 256 requests per dataset
+(128 development, 32 calibration, 96 test), balanced across the four length
+cells. The document cap is amended to 16 requests total and four per length
+cell. Document-level partitions, pilot exclusion, nonoverlap, gaps, test
+information barriers, and document-clustered inference are unchanged.
 
 Every later deviation must record date, protocol section, old value, new value,
 reason, whether any development/calibration/test result had been inspected, and
@@ -466,9 +477,9 @@ be relaxed after test inspection.
 
 ## Readiness Statement
 
-The current repository is **not ready to execute this confirmatory protocol**.
-It has real pilot collectors, analyses, a simulator, and preliminary GPU replay,
-but it does not yet provide document-level request construction, leakage-proof
-grouped partitions, three-seed predictor/scheduling orchestration, fixed-length
-online arrival replay with queue delay, or real shared-profile execution. Those
-are implementation tasks after this preregistration is accepted and committed.
+The request-demand collection stage now provides document-level request
+construction, leakage-proof partitions, pilot exclusion, pinned datasets, and
+resumable validated shards. The full protocol is still **not complete** because
+three-seed predictor/scheduling orchestration, fixed-length online arrival replay
+with queue delay, and real shared-profile execution remain later implementation
+stages.

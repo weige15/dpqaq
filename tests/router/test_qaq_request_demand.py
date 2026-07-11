@@ -1,4 +1,5 @@
 import json
+from collections import Counter
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -16,6 +17,14 @@ from scripts.analyze_qaq_request_demand import (
     feature_matrix,
     predictor_analysis,
     scheduler_oracle_analysis,
+)
+from scripts.qaq_request_demand_protocol import (
+    aggregate_records,
+    atomic_write_jsonl,
+    document_partition,
+    ensure_shard_metadata,
+    enumerate_document_candidates,
+    validate_record,
 )
 from scripts.build_qaq_request_demand_dataset import (
     build_request_windows,
@@ -172,3 +181,137 @@ def test_predictor_analysis_uses_only_prompt_features_and_cross_validation():
     assert len(result["group_profile_regressor"]["predictions"]) == 20
     assert result["minimum_safe_precision_classifier"]["status"] == "CROSS_VALIDATED"
     assert "continuation" not in " ".join(result["feature_names"])
+
+
+def protocol_request(request_id="r0", continuation_length=2):
+    return {
+        "request_id": request_id,
+        "request_index": 0,
+        "dataset": "wikitext2",
+        "source_index": 10,
+        "document_id": "d" * 64,
+        "partition": "test",
+        "start_token": 0,
+        "end_token": 6,
+        "prompt_length_tokens": 4,
+        "continuation_length_tokens": continuation_length,
+        "selection_sha256": "s" * 64,
+        "prompt_token_sha256": "p" * 64,
+        "continuation_token_sha256": "c" * 64,
+        "request_token_sha256": "r" * 64,
+    }
+
+
+def protocol_record(request, mean_nll=1.0):
+    modes = [
+        "fixed_low",
+        "fixed_4",
+        "fixed_5",
+        "fixed_high",
+        "dp_threshold_only",
+        "mlp_multibit",
+        "mlp_multibit_dp_guard",
+    ]
+    quality = {
+        mode: {
+            "mean_nll": mean_nll,
+            "nll_delta_vs_fixed_high": 0.0,
+            "perplexity": float(np.exp(mean_nll)),
+            "finite_logits": True,
+            "target_token_count": request["continuation_length_tokens"],
+            "average_selected_bit": 5.0,
+            "effective_bits": 5.0,
+            "fallback_count": 0,
+            "fallback_fraction": 0.0,
+            "dp_guard_trigger_count": 0,
+            "dp_guard_trigger_fraction": 0.0,
+        }
+        for mode in modes
+    }
+    return {
+        "schema_version": "qaq_request_demand_v2",
+        "manifest_sha256": "m" * 64,
+        "request_id": request["request_id"],
+        "prompt_token_sha256": request["prompt_token_sha256"],
+        "continuation_token_sha256": request["continuation_token_sha256"],
+        "request_token_sha256": request["request_token_sha256"],
+        "prompt_length_tokens": request["prompt_length_tokens"],
+        "continuation_length_tokens": request["continuation_length_tokens"],
+        "source": {"partition": request["partition"]},
+        "quality_by_mode": quality,
+        "minimum_safe_precision": {"requested_bit": 5},
+        "contains_raw_text": False,
+    }
+
+
+def test_document_partition_is_stable_and_document_level():
+    doc_id = "a" * 64
+    assert document_partition(doc_id) == document_partition(doc_id)
+    assert document_partition(doc_id) in {"development", "calibration", "test"}
+
+
+def test_candidate_enumeration_enforces_gap_and_document_caps():
+    candidates = enumerate_document_candidates(
+        dataset_name="wikitext2",
+        source_index=1,
+        doc_id="b" * 64,
+        partition="development",
+        token_ids=list(range(20000)),
+    )
+
+    assert len(candidates) == 16
+    per_cell = Counter(
+        (item["prompt_length_tokens"], item["continuation_length_tokens"])
+        for item in candidates
+    )
+    assert max(per_cell.values()) <= 4
+    intervals = sorted((item["start_token"], item["end_token"]) for item in candidates)
+    assert all(current[0] - previous[1] >= 128 for previous, current in zip(intervals, intervals[1:]))
+
+
+def test_validate_record_requires_continuation_only_metrics_and_rejects_raw_text():
+    request = protocol_request()
+    record = protocol_record(request)
+    expected_modes = list(record["quality_by_mode"])
+
+    validate_record(record, request, "m" * 64, expected_modes)
+
+    record["quality_by_mode"]["fixed_low"]["target_token_count"] = 3
+    with pytest.raises(ValueError, match="continuation-only"):
+        validate_record(record, request, "m" * 64, expected_modes)
+
+    record = protocol_record(request)
+    record["prompt_text"] = "copyrighted payload"
+    with pytest.raises(ValueError, match="Raw text"):
+        validate_record(record, request, "m" * 64, expected_modes)
+
+
+def test_validated_shard_roundtrip_is_idempotent(tmp_path):
+    request = protocol_request()
+    record = protocol_record(request)
+    shard = tmp_path / "shard-00000.jsonl"
+    atomic_write_jsonl(shard, [record])
+    expected_modes = list(record["quality_by_mode"])
+
+    first = ensure_shard_metadata(shard, [request], "m" * 64, expected_modes)
+    second = ensure_shard_metadata(shard, [request], "m" * 64, expected_modes)
+
+    assert first == second
+    assert first["validation_status"] == "VALIDATED"
+    assert first["record_count"] == 1
+    assert shard.with_suffix(".meta.json").exists()
+
+
+def test_aggregate_records_weights_nll_by_continuation_tokens():
+    short_request = protocol_request("short", continuation_length=2)
+    long_request = protocol_request("long", continuation_length=4)
+    short_record = protocol_record(short_request, mean_nll=1.0)
+    long_record = protocol_record(long_request, mean_nll=2.0)
+
+    summary = aggregate_records([short_record, long_record])
+
+    assert summary["request_count"] == 2
+    assert summary["continuation_token_count"] == 6
+    assert summary["quality_by_mode"]["fixed_high"][
+        "continuation_token_weighted_mean_nll"
+    ] == pytest.approx(5.0 / 3.0)

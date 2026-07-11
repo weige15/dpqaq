@@ -43,11 +43,20 @@ def parse_args():
             "observed QAQ profiles, and pre-decode prompt features."
         )
     )
+    parser.add_argument(
+        "--protocol",
+        choices=["legacy", "preregistered_large_v1"],
+        default="legacy",
+    )
     parser.add_argument("--ap_model_path", required=True)
     parser.add_argument("--router_checkpoint", required=True)
     parser.add_argument("--estimator_results", required=True)
     parser.add_argument("--tokenizer_path", default=None)
     parser.add_argument("--dataset", choices=["wikitext2", "c4_new"], default="wikitext2")
+    parser.add_argument(
+        "--datasets", nargs="+", choices=["wikitext2", "c4_new"],
+        default=["wikitext2", "c4_new"],
+    )
     parser.add_argument("--dataset_start", type=int, default=0)
     parser.add_argument("--num_requests", type=int, default=32)
     parser.add_argument("--prompt_length", type=int, default=128)
@@ -60,8 +69,13 @@ def parse_args():
     parser.add_argument("--fallback_bits", type=int, default=1)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--torch_dtype", choices=["float16", "bfloat16"], default="float16")
-    parser.add_argument("--output_jsonl", required=True)
-    parser.add_argument("--summary_json", required=True)
+    parser.add_argument("--output_jsonl")
+    parser.add_argument("--summary_json")
+    parser.add_argument("--output_dir")
+    parser.add_argument("--shard_size", type=int, default=8)
+    parser.add_argument("--manifest_only", action="store_true")
+    parser.add_argument("--validate_only", action="store_true")
+    parser.add_argument("--local_files_only", action="store_true")
     parser.add_argument("--trust_remote_code", action="store_true", default=True)
     parser.add_argument("--no_trust_remote_code", action="store_false", dest="trust_remote_code")
     return parser.parse_args()
@@ -77,8 +91,17 @@ def git_commit() -> str:
 def source_provenance() -> dict[str, Any]:
     paths = (
         Path("scripts/build_qaq_request_demand_dataset.py"),
+        Path("scripts/qaq_request_demand_protocol.py"),
+        Path("scripts/evaluate_qaq_heldout.py"),
+        Path("doc/qaq-request-demand-preregistered-protocol.md"),
         Path("any_precision/modules/QAQDPLLM_Linear.py"),
         Path("any_precision/modules/QAQDPLLMForCausalLM.py"),
+        Path("any_precision/modules/QAQRouter.py"),
+        Path("any_precision/modules/AnyPrecisionLinear.py"),
+        Path("any_precision/modules/DPLLM_Linear.py"),
+        Path("any_precision/modules/kernels/main.cu"),
+        Path("any_precision/modules/kernels/matmul.cuh"),
+        Path("any_precision/modules/kernels/dequant.cuh"),
     )
     hashes = {
         str(path): hashlib.sha256((REPO_ROOT / path).read_bytes()).hexdigest()
@@ -88,7 +111,11 @@ def source_provenance() -> dict[str, Any]:
         ["git", "status", "--porcelain"], cwd=REPO_ROOT, text=True,
         capture_output=True, check=False,
     )
-    return {"git_worktree_dirty": bool(status.stdout.strip()), "source_files_sha256": hashes}
+    return {
+        "git_commit": git_commit(),
+        "git_worktree_dirty": bool(status.stdout.strip()),
+        "source_files_sha256": hashes,
+    }
 
 
 def build_request_windows(
@@ -383,20 +410,37 @@ def summarize_records(records: list[dict[str, Any]], metadata: dict[str, Any]) -
 
 
 def validate_args(args, checkpoint: dict[str, Any]) -> list[int]:
-    device = torch.device(args.device)
-    if device.type != "cuda" or not torch.cuda.is_available():
-        raise RuntimeError("Request-demand collection requires a real CUDA device")
-    if not os.environ.get("CUDA_VISIBLE_DEVICES"):
-        raise RuntimeError("Set CUDA_VISIBLE_DEVICES explicitly")
-    if args.num_requests < 1 or args.profile_layer_group_size < 1:
-        raise ValueError("num_requests and profile_layer_group_size must be positive")
-    if args.safe_nll_delta < 0:
-        raise ValueError("safe_nll_delta must be non-negative")
     if checkpoint.get("label_mode") != "multibit":
         raise ValueError("Request-demand collection requires a multibit router checkpoint")
     bits = sorted(int(bit) for bit in checkpoint["candidate_bits"])
     if args.bits is not None and sorted(args.bits) != bits:
         raise ValueError(f"--bits {sorted(args.bits)} do not match checkpoint bits {bits}")
+    if args.safe_nll_delta < 0 or args.profile_layer_group_size < 1:
+        raise ValueError("safe_nll_delta must be non-negative and group size must be positive")
+
+    if args.protocol == "preregistered_large_v1":
+        if not args.output_dir:
+            raise ValueError("--output_dir is required for preregistered_large_v1")
+        if args.output_jsonl or args.summary_json:
+            raise ValueError("Large protocol writes shards and summaries under --output_dir")
+        if args.shard_size < 1:
+            raise ValueError("--shard_size must be positive")
+        if len(set(args.datasets)) != len(args.datasets):
+            raise ValueError("--datasets must not contain duplicates")
+        if args.manifest_only and args.validate_only:
+            raise ValueError("--manifest_only and --validate_only are mutually exclusive")
+        if args.manifest_only or args.validate_only:
+            return bits
+
+    device = torch.device(args.device)
+    if device.type != "cuda" or not torch.cuda.is_available():
+        raise RuntimeError("Request-demand collection requires a real CUDA device")
+    if not os.environ.get("CUDA_VISIBLE_DEVICES"):
+        raise RuntimeError("Set CUDA_VISIBLE_DEVICES explicitly")
+    if args.protocol == "legacy" and (not args.output_jsonl or not args.summary_json):
+        raise ValueError("Legacy collection requires --output_jsonl and --summary_json")
+    if args.num_requests < 1:
+        raise ValueError("num_requests must be positive")
     return bits
 
 
@@ -405,6 +449,19 @@ def main():
     router, checkpoint = load_qaq_router_checkpoint(args.router_checkpoint)
     bits = validate_args(args, checkpoint)
     device = torch.device(args.device)
+
+    if args.protocol == "preregistered_large_v1":
+        from scripts.qaq_request_demand_protocol import run_preregistered_collection
+
+        result = run_preregistered_collection(
+            args=args,
+            router=router,
+            checkpoint=checkpoint,
+            collect_request=collect_request,
+            source_provenance=source_provenance(),
+        )
+        print(json.dumps(result, indent=2))
+        return
 
     tokenizer_path = args.tokenizer_path or args.ap_model_path
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=args.trust_remote_code)

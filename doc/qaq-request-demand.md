@@ -185,3 +185,82 @@ Pre-decode prediction:
   profiles may differ.
 - Results use the installed Transformers/Datasets stack recorded in the
   artifacts and include a non-fatal Accelerate device-map warning.
+
+## Preregistered Large Collection
+
+The preregistered collector uses document-level deterministic manifests, pinned
+dataset revisions, atomic validated JSONL shards, and resumable execution. It
+writes to a dedicated directory and does not read, replace, or append to the
+32-request pilot artifact.
+
+Pinned sources:
+
+- WikiText-2 test revision
+  `b08601e04326c79dfdd32d625aee71d232d685c3`.
+- C4 validation shard `en/c4-validation.00000-of-00008.json.gz` at revision
+  `607bd4c8450a42878aa9ddc051a65a055450ef87`.
+
+CPU-only manifest preflight:
+
+```bash
+HF_DATASETS_OFFLINE=1 python scripts/build_qaq_request_demand_dataset.py \
+  --protocol preregistered_large_v1 \
+  --ap_model_path <AP_MODEL_PATH> \
+  --router_checkpoint <ROUTER_CHECKPOINT> \
+  --estimator_results <ESTIMATOR_DIR> \
+  --tokenizer_path <TOKENIZER_PATH> \
+  --datasets wikitext2 c4_new \
+  --bits 3 4 5 6 \
+  --manifest_only \
+  --local_files_only \
+  --output_dir artifacts/qaq-request-demand-preregistered-v1
+```
+
+Real Device 0 collection:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 HF_DATASETS_OFFLINE=1 \
+  python scripts/build_qaq_request_demand_dataset.py \
+  --protocol preregistered_large_v1 \
+  --ap_model_path <AP_MODEL_PATH> \
+  --router_checkpoint <ROUTER_CHECKPOINT> \
+  --estimator_results <ESTIMATOR_DIR> \
+  --tokenizer_path <TOKENIZER_PATH> \
+  --datasets wikitext2 c4_new \
+  --bits 3 4 5 6 \
+  --safe_nll_delta 0.02 \
+  --profile_layer_group_size 4 \
+  --confidence_threshold 0.6 \
+  --fallback_bits 1 \
+  --shard_size 8 \
+  --device cuda:0 \
+  --local_files_only \
+  --output_dir artifacts/qaq-request-demand-preregistered-v1
+```
+
+Re-running the same command validates and skips every completed shard. A
+different manifest, source hash, input hash, or collection configuration fails
+rather than mixing results. An interruption can lose only the uncommitted
+in-memory shard; finalized shards are never overwritten.
+
+Post-run validation without loading the model:
+
+```bash
+HF_DATASETS_OFFLINE=1 python scripts/build_qaq_request_demand_dataset.py \
+  --protocol preregistered_large_v1 \
+  --ap_model_path <AP_MODEL_PATH> \
+  --router_checkpoint <ROUTER_CHECKPOINT> \
+  --estimator_results <ESTIMATOR_DIR> \
+  --tokenizer_path <TOKENIZER_PATH> \
+  --datasets wikitext2 c4_new \
+  --bits 3 4 5 6 \
+  --validate_only \
+  --local_files_only \
+  --output_dir artifacts/qaq-request-demand-preregistered-v1
+```
+
+The output contains document/request manifests, eight-request JSONL shards,
+one validation sidecar per shard, a run manifest, per-dataset summaries, and
+`combined-summary.json`. Records contain hashes and numeric features/metrics
+only; raw source, prompt, and continuation text and token arrays are prohibited
+by shard validation.
