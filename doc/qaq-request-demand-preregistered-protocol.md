@@ -494,6 +494,20 @@ post-run commit cannot restore the missing preregistration barrier, results
 from this collection must disclose this deviation and cannot be described as
 strictly preregistration-clean confirmatory evidence.
 
+Post-hoc endpoint-repair amendment, 2026-07-11: after confirmatory
+request-demand labels and aggregate quality results had been inspected, a
+separately identified route-safety supplement and primary-policy online GPU
+replay were requested. The original collection did not store the per-decision
+real-output required-bit labels needed for the H3 route-safety gate, and the
+repository did not implement the registered online arrival queue needed for
+H4. The repair keeps the completed collection immutable, reconstructs its exact
+registered token requests from frozen manifests, writes route labels and replay
+timings to new artifact roots, and records independent source/input hashes.
+Because implementation choices were made after test inspection, supplemental
+H3 and H4 results are post-hoc deviation evidence and cannot restore a strictly
+preregistered confirmatory claim. The numerical H3/H4 thresholds are unchanged
+and failures must still be reported.
+
 Every later deviation must record date, protocol section, old value, new value,
 reason, whether any development/calibration/test result had been inspected, and
 which outputs are exploratory as a consequence. Confirmatory criteria may not

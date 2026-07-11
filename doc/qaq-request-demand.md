@@ -293,3 +293,78 @@ quality-gate failure when present and separately marks route-level
 under-precision unavailable because the collection lacks per-decision required
 bits. H4 remains not run until real online GPU replay exists. The dirty-source
 precommit deviation is disclosed in both the protocol and analysis output.
+
+
+## Supplemental Route Safety And H4 Replay
+
+This work is separately identified as post-hoc and does not repair the
+preregistration-order deviation. It never writes into the frozen request-demand
+collection. The supplemental collector reconstructs its exact manifests and
+prompt/continuation token hashes, then obtains real per-route required-bit
+labels from candidate-bit versus highest-valid-bit output relative error at the
+router checkpoint threshold. It writes two-request atomic JSONL shards with
+continuation-only quality metrics and prohibits raw text and token arrays.
+
+Completed Device 0 supplement:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 HF_DATASETS_OFFLINE=1 PYTHONUNBUFFERED=1 \
+  /nfs/home/s314511048/.venv/bin/python scripts/collect_qaq_route_safety_supplement.py \
+  --collection_dir artifacts/qaq-request-demand-preregistered-v1 \
+  --freeze_manifest artifacts/qaq-request-demand-preregistered-v1-freeze.json \
+  --ap_model_path cache/packed/anyprec-\(Meta-Llama-3.1-8B\)-w6_orig3-gc1-c4_s100_blk512 \
+  --router_checkpoint checkpoints/qaq_router_llama31_8b_th005.pt \
+  --estimator_results estimator_private_values/anyprec-\(Meta-Llama-3.1-8B\)-w6_orig3-gc1-c4_s100_blk512/finetuned_max6.0_3b-6b_th_pb_train_0.01_1.0_1ep_targ4.5b_init_0-40_adam \
+  --tokenizer_path cache/packed/anyprec-\(Meta-Llama-3.1-8B\)-w6_orig3-gc1-c4_s100_blk512 \
+  --output_dir artifacts/qaq-route-safety-supplement-v1 \
+  --bits 3 4 5 6 --confidence_threshold 0.6 --fallback_bits 1 \
+  --oracle_batch_size 128 --shard_size 2 --device cuda:0 \
+  --torch_dtype float16 --local_files_only
+```
+
+The supplement has ID
+`286b3740ffaf877ed7c8358f387bb559d6ee206d46d2459e75f6823956ffb54b` and
+contains 192 requests in 96 validated shards. Guarded under-precision was
+5.79% on C4 and 6.11% on WikiText-2; both exceed the registered 1% point and
+2% one-sided-upper-bound gates, so the route-safety prerequisite fails.
+
+The online replay pairs predictor seeds `(17,29,43)` by index with scheduling
+seeds `(101,202,303)`, preserving the registered 162-scenario matrix. It uses
+real cached greedy decode, CUDA-synchronized timing, exact continuation token
+slots, maximum batch size 4, 50 ms maximum wait, and resumable per-scenario
+artifacts. The full registered command is:
+
+```bash
+CUBLAS_WORKSPACE_CONFIG=:4096:8 CUDA_VISIBLE_DEVICES=0 \
+  HF_DATASETS_OFFLINE=1 PYTHONUNBUFFERED=1 \
+  /nfs/home/s314511048/.venv/bin/python scripts/run_qaq_online_scheduler_replay.py \
+  --collection_dir artifacts/qaq-request-demand-preregistered-v1 \
+  --freeze_manifest artifacts/qaq-request-demand-preregistered-v1-freeze.json \
+  --analysis_json artifacts/qaq-request-demand-preregistered-v1-analysis/analysis.json \
+  --route_safety_dir artifacts/qaq-route-safety-supplement-v1 \
+  --ap_model_path cache/packed/anyprec-\(Meta-Llama-3.1-8B\)-w6_orig3-gc1-c4_s100_blk512 \
+  --router_checkpoint checkpoints/qaq_router_llama31_8b_th005.pt \
+  --estimator_results estimator_private_values/anyprec-\(Meta-Llama-3.1-8B\)-w6_orig3-gc1-c4_s100_blk512/finetuned_max6.0_3b-6b_th_pb_train_0.01_1.0_1ep_targ4.5b_init_0-40_adam \
+  --tokenizer_path cache/packed/anyprec-\(Meta-Llama-3.1-8B\)-w6_orig3-gc1-c4_s100_blk512 \
+  --output_dir artifacts/qaq-h4-online-replay-v1 \
+  --bits 3 4 5 6 --confidence_threshold 0.6 --fallback_bits 1 \
+  --warmup_batches 5 --repeat 3 --bootstrap_replicates 10000 \
+  --bootstrap_seed 1729 --device cuda:0 --torch_dtype float16 \
+  --local_files_only
+```
+
+A rerun validates and skips completed calibration, warmup, and scenario files.
+A separately identified real-path diagnostic completed on Device 0 and is
+archived at `artifacts/qaq-h4-online-replay-diagnostic-v1`. Its manifest records
+`max_scenarios=1`, `diagnostic_request_limit=4`, skipped registered warmups,
+one repeat, and 100 bootstrap replicates, so it cannot be mistaken for H4. The
+run committed one four-request C4/50%-load/seed-101 ordinary-FCFS scenario with
+real cached greedy decode, 128 generated token slots, three batches, no OOM,
+and no deadline misses. Replay ID:
+`1c2ef26f43348528b1bab0e95ff63e385443081b3a8879299b4942847ea558c7`.
+
+The full matrix has not been run or claimed complete. Its registered guarded
+quality and route-safety prerequisites already fail, so a multi-day performance
+matrix cannot change the H4 verdict and would provide only post-hoc descriptive
+performance estimates. Run the full command above only if those estimates are
+explicitly needed despite the failed prerequisites.
