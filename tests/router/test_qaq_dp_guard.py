@@ -75,6 +75,43 @@ def test_dp_threshold_only_uses_low_and_high_threshold_branches(monkeypatch):
     assert linear.dp_guard_count == 0
 
 
+def test_fixed_precision_executes_requested_intermediate_bit(monkeypatch):
+    install_fake_kernels(monkeypatch)
+    linear = make_threshold_linear(router_mode="fixed_precision")
+
+    linear.set_precision(4)
+    y = linear(threshold_inputs())
+
+    assert y.squeeze(-1).tolist() == [2.0, 8.0]
+    assert linear.comp_count[4] == 2
+
+    linear.set_precision(9)
+    assert linear._requested_valid_bit() == 6
+
+
+def test_decision_observer_receives_actual_fixed_and_grouped_bits(monkeypatch):
+    install_fake_kernels(monkeypatch)
+    observed = []
+    linear = make_threshold_linear(router_mode="fixed_low")
+    linear.set_decision_observer(
+        lambda module, x, bits: observed.append((module.route_name, x.clone(), bits.clone()))
+    )
+
+    x = threshold_inputs()
+    linear(x)
+    linear.set_router_mode("dp_threshold_only")
+    linear(x)
+
+    assert observed[0][0] == "0.q_proj"
+    torch.testing.assert_close(observed[0][1], x)
+    assert observed[0][2].tolist() == [3, 3]
+    assert observed[1][2].tolist() == [3, 6]
+
+    linear.set_decision_observer(None)
+    linear(x)
+    assert len(observed) == 2
+
+
 class StaticRouter(nn.Module):
     bits = [3, 4, 6]
     use_estimated_error = False

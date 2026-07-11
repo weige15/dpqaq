@@ -101,6 +101,7 @@ class QAQDPLLM_Linear(nn.Module):
         self.dp_threshold_high_count = 0
         self.routed_token_count = 0
         self.phase_timing_enabled = False
+        self.decision_observer = None
         self.clear_phase_timing()
 
     @property
@@ -152,7 +153,20 @@ class QAQDPLLM_Linear(nn.Module):
             raise RuntimeError(f"No valid precision remains for {self.route_name}")
         return min(valid_bits)
 
+    def _requested_valid_bit(self):
+        valid_bits = self._valid_bits()
+        if not valid_bits:
+            raise RuntimeError(f"No valid precision remains for {self.route_name}")
+        lower_or_equal = [bit for bit in valid_bits if bit <= self.precision]
+        return max(lower_or_equal) if lower_or_equal else min(valid_bits)
+
+
     def _fixed_precision_forward(self, x, bit):
+        flat_x = x.reshape(-1, x.shape[-1])
+        self._notify_decision(
+            flat_x,
+            torch.full((flat_x.shape[0],), bit, dtype=torch.long, device=x.device),
+        )
         if self._is_prefill(x):
             weight = dequant_kbit(self.qweight, self._buffers[f'lut{bit}'], bit)
             y = torch.matmul(x, weight.T)
@@ -168,6 +182,8 @@ class QAQDPLLM_Linear(nn.Module):
             return self._fixed_precision_forward(x, self._min_valid_bit())
         if self.router_mode == "fixed_high":
             return self._fixed_precision_forward(x, self._max_valid_bit())
+        if self.router_mode == "fixed_precision":
+            return self._fixed_precision_forward(x, self._requested_valid_bit())
         if self.router_mode not in {
             "mlp_binary",
             "mlp_multibit",
@@ -203,6 +219,8 @@ class QAQDPLLM_Linear(nn.Module):
         with self._record_phase("grouping", flat_x):
             selected_bits = sorted(set(chosen_bits.detach().cpu().tolist()))
 
+        self._notify_decision(flat_x, chosen_bits)
+
         for bit in selected_bits:
             with self._record_phase("grouping", flat_x):
                 mask = chosen_bits == bit
@@ -219,6 +237,14 @@ class QAQDPLLM_Linear(nn.Module):
             self.comp_count[bit] += row_count
 
         return y_flat.reshape(*original_shape, self.out_features)
+
+    def _notify_decision(self, flat_x, chosen_bits):
+        if self.decision_observer is not None:
+            self.decision_observer(self, flat_x.detach(), chosen_bits.detach())
+
+    def set_decision_observer(self, observer=None):
+        """Attach an opt-in evaluator callback without changing routing decisions."""
+        self.decision_observer = observer
 
     def _choose_mode_bits(self, flat_x):
         if self.router_mode == "dp_threshold_only":

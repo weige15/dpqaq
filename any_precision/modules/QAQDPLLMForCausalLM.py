@@ -478,6 +478,10 @@ class QAQDPLLMForCausalLM(nn.Module):
             if hasattr(linear, "set_phase_timing_enabled"):
                 linear.set_phase_timing_enabled(enabled)
 
+    def set_decision_observer(self, observer=None):
+        for linear in self.ap_linears:
+            linear.set_decision_observer(observer)
+
     def prune_precisions(self):
         for ap_linear in self.ap_linears:
             ap_linear.prune_precisions()
