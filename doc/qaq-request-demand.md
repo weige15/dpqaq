@@ -264,3 +264,32 @@ one validation sidecar per shard, a run manifest, per-dataset summaries, and
 `combined-summary.json`. Records contain hashes and numeric features/metrics
 only; raw source, prompt, and continuation text and token arrays are prohibited
 by shard validation.
+
+
+## Preregistered Offline Analysis
+
+The completed collection is frozen by
+`artifacts/qaq-request-demand-preregistered-v1-freeze.json`. The analyzer
+verifies that recursive file manifest before and after analysis and writes only
+to a separate output directory.
+
+```bash
+python scripts/analyze_qaq_request_demand_preregistered.py \
+  --collection_dir artifacts/qaq-request-demand-preregistered-v1 \
+  --freeze_manifest artifacts/qaq-request-demand-preregistered-v1-freeze.json \
+  --output_json artifacts/qaq-request-demand-preregistered-v1-analysis/analysis.json \
+  --bootstrap_replicates 10000 \
+  --bootstrap_seed 1729 \
+  --predictor_seeds 17 29 43 \
+  --trees 300 \
+  --group_folds 5
+```
+
+This analysis uses document-grouped development diagnostics, the frozen pooled
+development/calibration split, separate WikiText-2 and C4 test reports, all
+three registered predictor seeds, and document-cluster bootstrap intervals.
+H1 and H2 are evaluated from the collected endpoints. H3 reports a definitive
+quality-gate failure when present and separately marks route-level
+under-precision unavailable because the collection lacks per-decision required
+bits. H4 remains not run until real online GPU replay exists. The dirty-source
+precommit deviation is disclosed in both the protocol and analysis output.

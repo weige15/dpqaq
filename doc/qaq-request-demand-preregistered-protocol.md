@@ -470,6 +470,30 @@ cells. The document cap is amended to 16 requests total and four per length
 cell. Document-level partitions, pilot exclusion, nonoverlap, gaps, test
 information barriers, and document-clustered inference are unchanged.
 
+Post-run provenance deviation, 2026-07-11: the request-demand collection was
+started and completed from an uncommitted worktree at Git commit
+`228c394ae1a4e051b8df3ed75fa83431bc5209e3`. This violates Run Order step 1,
+which required the amended protocol to be committed before confirmatory model
+results were collected. The implementation and protocol bytes used by the run
+were not changed during collection; their exact per-file SHA-256 values remain
+frozen in `artifacts/qaq-request-demand-preregistered-v1/run-manifest.json`.
+The completed collection has collection ID
+`fd9b2ca00dc53735a8c486d3b58f034e93f7ac89b60b48cba1577659657f8063`,
+WikiText manifest SHA-256
+`ff347bb9e854f79fbe5b453befbc8724c9106860187daebf45ac0481e052f798`,
+C4 manifest SHA-256
+`06815968011d57c40558215d3033fd43ed8a527b2491ee274127181b46934e8e`,
+and recursively frozen collection-tree SHA-256
+`f941f5bb3b4253791377f8059c1ee12a00b8c4b64abdfa1fa97c505817dc1f12`.
+The external machine-readable freeze is
+`artifacts/qaq-request-demand-preregistered-v1-freeze.json`, whose recorded
+run-manifest SHA-256 is
+`8c374bef70888c01204de5d58fc3fceb44fece7186a35d8504141b9e32a2a6a7`.
+No collection file may be modified during downstream analysis. Because a
+post-run commit cannot restore the missing preregistration barrier, results
+from this collection must disclose this deviation and cannot be described as
+strictly preregistration-clean confirmatory evidence.
+
 Every later deviation must record date, protocol section, old value, new value,
 reason, whether any development/calibration/test result had been inspected, and
 which outputs are exploratory as a consequence. Confirmatory criteria may not
