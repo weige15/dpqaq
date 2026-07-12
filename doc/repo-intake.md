@@ -14,6 +14,11 @@ Python package for Any-Precision / DP-LLM quantized causal language model infere
 - `4_save_th.py`: saves DP-LLM threshold values.
 - `test_pp.py`: evaluates perplexity with `DPLLMForCausalLM`.
 - `demo.py` / `run_eval.py` / `evaluate.sh`: example and evaluation helpers.
+- `scripts/build_qaq_request_demand_dataset.py`: collects real fixed-bit quality targets, observed QAQ profiles, and prompt/prefill-only features for the preregistered two-dataset request-demand study.
+- `scripts/analyze_qaq_request_demand.py`: legacy pilot analyzer for the v1 request-level oracle and shuffled K-fold predictor analysis.
+- `scripts/predecode_predictors.py`: held-out v2 predictor training/evaluation with document-cluster bootstrap confidence intervals and conservative uncertainty fallback; accepts multiple source collections.
+- `scripts/collect_qaq_fineweb_request_demand.py`: real CUDA FineWeb-Edu source-document collection using the shared QAQ callback.
+- `scripts/qaq_request_demand_protocol.py`: deterministic source-document manifests, document partitions, shard validation, and v2 record schemas.
 
 ## Install Commands
 
@@ -60,6 +65,8 @@ Python package for Any-Precision / DP-LLM quantized causal language model infere
 - `dp_llm.pdf`: user-provided research paper input; do not modify.
 - `figures/*.png`: imported documentation assets from DP-LLM.
 - Generated estimator outputs are expected under paths like `estimator_private_values/` and `estimator_shared_values/`; avoid committing large generated artifacts.
+- `artifacts/qaq-request-demand-preregistered-v1/`: real 512-request v2 request-demand collection with separate WikiText-2 and C4 document partitions. Treat it as an input artifact; do not rewrite it during offline predictor analysis.
+- Cached FineWeb-Edu sample parquet files under the user Hugging Face cache are external read-only inputs for the new collector; generated FineWeb records are written outside the repository.
 
 ## Config Files
 
@@ -75,6 +82,8 @@ Python package for Any-Precision / DP-LLM quantized causal language model infere
 - `DPLLMForCausalLM.fuse_layers` and related `fuse_layers` methods are TODO/pass placeholders.
 - The CUDA extension `any_precision_ext` is mandatory for real quantized execution.
 - No local quantized model checkpoint is present in this workspace.
+- The preregistered v2 collection exists, but the legacy analyzer only consumes `qaq_request_demand_v1` and uses shuffled request-level folds. The strict held-out path is `scripts/predecode_predictors.py`.
+- The FineWeb-Edu source extension is a bounded cached-parquet subset; it does not claim full FineWeb coverage.
 
 ## External Dependencies
 
@@ -90,6 +99,7 @@ Python package for Any-Precision / DP-LLM quantized causal language model infere
 - Avoid changing CUDA kernels unless required.
 - Avoid committing large generated checkpoints, datasets, estimator artifacts, or router training data.
 - Do not weaken existing DP-LLM behavior or remove existing scripts.
+- Preserve the preregistered request-demand collection and its manifests; predictor outputs and model bundles belong in a separate output path.
 
 ## Open Questions
 
