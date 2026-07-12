@@ -103,3 +103,27 @@ throughput, or serving benefit.
 For the three-source study, the LODO gate must pass for every held-out source
 and registered seed before scheduler integration is considered. Until then,
 the scheduler must remain on a conservative fixed-high fallback path.
+
+The expanded rerun uses four sources:
+
+    python scripts/predecode_predictors.py \
+      --dataset_path artifacts/qaq-request-demand-preregistered-v1 /tmp/dpqaq-fineweb-edu-v1/records.jsonl /tmp/dpqaq-hellaswag-v1/records.jsonl \
+      --datasets wikitext2 c4_new fineweb_edu hellaswag \
+      --evaluation_mode lodo \
+      --output_json /tmp/dpqaq-predecode-lodo-four-dataset.json \
+      --seeds 17 29 43 --trees 300 --alpha 0.10 \
+      --bootstrap_repetitions 1000
+
+The HellaSwag transfer rerun additionally includes the support-matched
+FineWeb records:
+
+    python scripts/predecode_predictors.py \
+      --dataset_path artifacts/qaq-request-demand-preregistered-v1 /tmp/dpqaq-fineweb-edu-v1/records.jsonl /tmp/dpqaq-fineweb-edu-short-v1/records.jsonl /tmp/dpqaq-hellaswag-v1/records.jsonl \
+      --datasets wikitext2 c4_new fineweb_edu hellaswag \
+      --evaluation_mode lodo \
+      --output_json /tmp/dpqaq-predecode-lodo-four-dataset-short-transfer.json \
+      --seeds 17 29 43 --trees 300 --alpha 0.10 \
+      --bootstrap_repetitions 1000
+
+The HellaSwag effective-bit and profile R² gates still fail after this
+support-matched improvement, so scheduler integration remains disabled.

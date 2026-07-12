@@ -53,3 +53,26 @@ The third-dataset result is a generalization check, not evidence that a
 scheduler is safe. Predictability still requires every registered dataset and
 seed to pass the safe-bit, effective-bit, and profile gates.
 
+
+## HellaSwag transfer supplement
+
+The collector supports a separate short_transfer profile with length cells
+32/16, 32/32, 64/16, and 64/32. A real supplement was collected from unused
+FineWeb-Edu shard 005_00000.parquet into /tmp/dpqaq-fineweb-edu-short-v1.
+It contains 256 new source documents with 128/32/96 development/calibration/
+test requests and zero document overlap with the original FineWeb collection.
+
+    CUDA_VISIBLE_DEVICES=4 python scripts/collect_qaq_fineweb_request_demand.py \
+      --ap_model_path <AP_MODEL_PATH> \
+      --router_checkpoint <ROUTER_CHECKPOINT> \
+      --estimator_results <ESTIMATOR_DIR> \
+      --tokenizer_path <TOKENIZER_PATH> \
+      --parquet_shards <FINEWEB_SHORT_PARQUET> \
+      --output_dir /tmp/dpqaq-fineweb-edu-short-v1 \
+      --row_limit 50000 --candidate_multiplier 8 \
+      --bits 3 4 5 6 --length_profile short_transfer \
+      --device cuda:0 --local_files_only
+
+This is a support-matching transfer improvement, not a scheduler decision.
+The expanded LODO result must still pass all endpoint gates for every source
+and seed.

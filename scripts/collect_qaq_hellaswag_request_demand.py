@@ -1,9 +1,10 @@
-"""Collect a source-document-preserving FineWeb-Edu request-demand subset.
+"""Collect a source-document-preserving HellaSwag request-demand subset.
 
-This is an extension collector for the existing v2 request-demand schema. It
-uses a bounded, deterministic prefix of cached parquet rows, hashes documents
-into the same development/calibration/test partitions, and runs the real QAQ
-quality/profile callback on CUDA. Raw text is never written to the artifact.
+Each HellaSwag source_id is treated as one source document. The document text
+contains only the real context fields ctx_a and ctx_b from that source; answer
+endings and labels are deliberately excluded. The collector uses the shared
+real QAQ quality/profile callback and writes the same v2 request schema as the
+existing WikiText, C4, and FineWeb collections.
 """
 
 from __future__ import annotations
@@ -14,7 +15,7 @@ import json
 import os
 import subprocess
 import sys
-from collections import Counter, defaultdict
+from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -23,7 +24,6 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-import datasets
 import torch
 from datasets import load_dataset
 from transformers import AutoTokenizer
@@ -31,6 +31,8 @@ from transformers import AutoTokenizer
 from any_precision import QAQDPLLMForCausalLM, load_qaq_router_checkpoint
 from scripts.build_qaq_request_demand_dataset import collect_request
 from scripts.qaq_request_demand_protocol import (
+    PROTOCOL_VERSION,
+    RECORD_SCHEMA_VERSION,
     aggregate_records,
     atomic_write_json,
     atomic_write_jsonl,
@@ -45,14 +47,11 @@ from scripts.qaq_request_demand_protocol import (
     validate_record,
 )
 
-DATASET_NAME = "fineweb_edu"
-DATASET_IDENTITY = "HuggingFaceFW/fineweb-edu|sample-10BT"
-DATASET_REVISION = "87f09149ef4734204d70ed1d046ddc9ca3f2b8f9"
+DATASET_NAME = "hellaswag"
+DATASET_IDENTITY = "Rowan/hellaswag|train|source_id"
+DATASET_REVISION = "218ec52e09a7e7462a5400043bb9a69a41d06b76"
 SOURCE_SPLIT = "train"
-SHORT_TRANSFER_LENGTH_CELLS = ((32, 16), (32, 32), (64, 16), (64, 32))
-PROTOCOL_VERSION = "qaq_fineweb_request_demand_v1"
-RECORD_SCHEMA_VERSION = "qaq_request_demand_v2"
-LENGTH_CELLS = ((128, 32), (128, 128), (512, 32), (512, 128))
+LENGTH_CELLS = ((32, 16), (32, 32), (64, 16), (64, 32))
 PARTITION_QUOTAS = {"development": 32, "calibration": 8, "test": 24}
 PARTITION_ORDER = {"development": 0, "calibration": 1, "test": 2}
 QAQ_MODES = ("dp_threshold_only", "mlp_multibit", "mlp_multibit_dp_guard")
@@ -60,16 +59,15 @@ QAQ_MODES = ("dp_threshold_only", "mlp_multibit", "mlp_multibit_dp_guard")
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Collect real FineWeb-Edu QAQ demand with source-document splits."
+        description="Collect real HellaSwag QAQ demand with source-document splits."
     )
     parser.add_argument("--ap_model_path", required=True)
     parser.add_argument("--router_checkpoint", required=True)
     parser.add_argument("--estimator_results", required=True)
     parser.add_argument("--tokenizer_path", default=None)
     parser.add_argument("--parquet_shards", nargs="+", required=True)
-    parser.add_argument("--length_profile", choices=("registered", "short_transfer"), default="registered")
     parser.add_argument("--output_dir", required=True)
-    parser.add_argument("--row_limit", type=int, default=50000)
+    parser.add_argument("--row_limit", type=int, default=39905)
     parser.add_argument("--candidate_multiplier", type=int, default=8)
     parser.add_argument("--bits", type=int, nargs="+", default=None)
     parser.add_argument("--safe_nll_delta", type=float, default=0.02)
@@ -94,8 +92,8 @@ def git_commit() -> str:
     return result.stdout.strip() if result.returncode == 0 else "UNAVAILABLE"
 
 
-def selection_hash(doc_id: str, source_index: int, prompt: int, continuation: int) -> str:
-    value = f"{doc_id}|{source_index}|{prompt}|{continuation}".encode("ascii")
+def selection_hash(doc_id_value: str, source_index: int, prompt: int, continuation: int) -> str:
+    value = f"{doc_id_value}|{source_index}|{prompt}|{continuation}".encode("ascii")
     return hashlib.sha256(value).hexdigest()
 
 
@@ -109,19 +107,21 @@ def canonical_metadata(parquet_paths: list[Path], row_limit: int) -> dict[str, A
         })
     return {
         "name": DATASET_NAME,
-        "hf_dataset": "HuggingFaceFW/fineweb-edu",
-        "config": "sample-10BT",
+        "hf_dataset": "Rowan/hellaswag",
+        "config": None,
         "split": SOURCE_SPLIT,
         "revision": DATASET_REVISION,
-        "document_unit": "parquet_row",
+        "document_unit": "source_id_context_concatenation",
+        "input_fields": ["ctx_a", "ctx_b"],
+        "excluded_fields": ["endings", "label"],
         "row_limit": int(row_limit),
         "parquet_files": files,
         "fingerprint": object_sha256(files),
     }
 
 
-def candidate_bucket(doc_id: str, length_cells: tuple[tuple[int, int], ...]) -> tuple[int, int]:
-    return length_cells[int(doc_id[:8], 16) % len(length_cells)]
+def candidate_bucket(doc_id_value: str) -> tuple[int, int]:
+    return LENGTH_CELLS[int(doc_id_value[:8], 16) % len(LENGTH_CELLS)]
 
 
 def collect_candidates(
@@ -129,7 +129,6 @@ def collect_candidates(
     parquet_paths: list[Path],
     row_limit: int,
     candidate_multiplier: int,
-    length_cells: tuple[tuple[int, int], ...],
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     if row_limit < 1 or candidate_multiplier < 1:
         raise ValueError("row_limit and candidate_multiplier must be positive")
@@ -139,66 +138,81 @@ def collect_candidates(
         split="train",
         streaming=True,
     )
-    candidates: dict[tuple[str, int, int], list[dict[str, Any]]] = defaultdict(list)
-    seen_documents: set[str] = set()
+    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
     scanned_rows = 0
     for row in dataset:
         if scanned_rows >= row_limit:
             break
         scanned_rows += 1
-        text = str(row.get("text") or "").replace("\r\n", "\n").replace("\r", "\n").strip("\n")
+        source_id = str(row.get("source_id") or "").strip()
+        ctx_a = str(row.get("ctx_a") or "").strip()
+        ctx_b = str(row.get("ctx_b") or "").strip()
+        if not source_id or not ctx_a:
+            continue
+        grouped[source_id].append({
+            "ind": int(row.get("ind") or scanned_rows - 1),
+            "text": f"{ctx_a} {ctx_b}".strip(),
+        })
+
+    candidates: dict[tuple[str, int, int], list[dict[str, Any]]] = defaultdict(list)
+    for source_id, rows in sorted(grouped.items()):
+        rows.sort(key=lambda item: item["ind"])
+        text = "\n".join(item["text"] for item in rows if item["text"])
         if not text:
             continue
-        doc_id = document_id(DATASET_IDENTITY, SOURCE_SPLIT, text)
-        if doc_id in seen_documents:
-            continue
-        seen_documents.add(doc_id)
-        partition = document_partition(doc_id)
-        prompt, continuation = candidate_bucket(doc_id, length_cells)
-        required_tokens = prompt + continuation
-        if int(row.get("token_count") or 0) < required_tokens:
-            continue
+        doc_id_value = document_id(DATASET_IDENTITY, SOURCE_SPLIT, source_id)
+        prompt, continuation = candidate_bucket(doc_id_value)
+        source_index = min(item["ind"] for item in rows)
+        row_identity = "|".join(str(item["ind"]) for item in rows)
         candidate = {
             "dataset": DATASET_NAME,
-            "source_index": scanned_rows - 1,
-            "document_id": doc_id,
-            "partition": partition,
+            "source_index": source_index,
+            "document_id": doc_id_value,
+            "partition": document_partition(doc_id_value),
             "prompt_length_tokens": prompt,
             "continuation_length_tokens": continuation,
             "start_token": 0,
-            "end_token": required_tokens,
-            "selection_sha256": selection_hash(doc_id, scanned_rows - 1, prompt, continuation),
-            "source_row_id_sha256": hashlib.sha256(str(row.get("id")).encode("utf-8")).hexdigest(),
-            "parquet_name": next(path.name for path in parquet_paths if path.exists()),
+            "end_token": prompt + continuation,
+            "selection_sha256": selection_hash(
+                doc_id_value, source_index, prompt, continuation
+            ),
+            "source_id_sha256": hashlib.sha256(source_id.encode("utf-8")).hexdigest(),
+            "source_row_id_sha256": hashlib.sha256(row_identity.encode("ascii")).hexdigest(),
+            "source_row_count": len(rows),
+            "source_id": source_id,
+            "parquet_name": parquet_paths[0].name,
             "_text": text,
         }
-        bucket = (partition, prompt, continuation)
-        candidates[bucket].append(candidate)
+        candidates[(candidate["partition"], prompt, continuation)].append(candidate)
 
     selected: list[dict[str, Any]] = []
     stratum_counts: dict[str, int] = {}
     for partition in PARTITION_ORDER:
-        for prompt, continuation in length_cells:
+        for prompt, continuation in LENGTH_CELLS:
             bucket = (partition, prompt, continuation)
             quota = PARTITION_QUOTAS[partition]
-            ordered = sorted(candidates.get(bucket, []), key=lambda item: item["selection_sha256"])
+            ordered = sorted(
+                candidates.get(bucket, []),
+                key=lambda item: item["selection_sha256"],
+            )
             chosen = []
-            for item in ordered[: quota * candidate_multiplier]:
+            for item in ordered:
                 token_ids = tokenizer(
                     item["_text"], add_special_tokens=False, verbose=False
                 )["input_ids"]
                 if len(token_ids) < item["end_token"]:
                     continue
-                item = dict(item)
-                item["token_ids"] = token_ids[: item["end_token"]]
-                del item["_text"]
-                chosen.append(item)
+                public = dict(item)
+                public["token_ids"] = token_ids[: item["end_token"]]
+                del public["_text"]
+                del public["source_id"]
+                chosen.append(public)
                 if len(chosen) == quota:
                     break
             if len(chosen) != quota:
                 raise RuntimeError(
-                    f"FineWeb subset cannot fill {bucket}: {len(chosen)} / {quota}; "
-                    "increase --row_limit or --candidate_multiplier"
+                    f"HellaSwag subset cannot fill {bucket}: "
+                    f"{len(chosen)} / {quota}; increase --row_limit"
                 )
             selected.extend(chosen)
             stratum_counts[f"{partition}:{prompt}p:{continuation}c"] = len(chosen)
@@ -213,12 +227,16 @@ def collect_candidates(
     )
     for request_index, item in enumerate(selected):
         item["request_index"] = request_index
-        item["request_id"] = f"{DATASET_NAME}-{item['partition'][:3]}-{item['selection_sha256'][:16]}"
+        item["request_id"] = (
+            f"{DATASET_NAME}-{item['partition'][:3]}-"
+            f"{item['selection_sha256'][:16]}"
+        )
     metadata = {
         "scanned_row_count": scanned_rows,
-        "unique_document_count": len(seen_documents),
+        "source_document_count": len(grouped),
         "selected_request_count": len(selected),
         "stratum_counts": stratum_counts,
+        "candidate_multiplier": int(candidate_multiplier),
     }
     return selected, metadata
 
@@ -227,7 +245,6 @@ def build_manifest(
     requests: list[dict[str, Any]],
     dataset_metadata: dict[str, Any],
     tokenizer_metadata: dict[str, Any],
-    length_cells: tuple[tuple[int, int], ...],
 ) -> dict[str, Any]:
     public_requests = []
     documents: dict[str, dict[str, Any]] = {}
@@ -246,7 +263,9 @@ def build_manifest(
                 "prompt_length_tokens",
                 "continuation_length_tokens",
                 "selection_sha256",
+                "source_id_sha256",
                 "source_row_id_sha256",
+                "source_row_count",
                 "parquet_name",
             )
         }
@@ -257,21 +276,24 @@ def build_manifest(
                 "document_id": request["document_id"],
                 "partition": request["partition"],
                 "source_index": request["source_index"],
+                "source_id_sha256": request["source_id_sha256"],
                 "source_row_id_sha256": request["source_row_id_sha256"],
+                "source_row_count": request["source_row_count"],
                 "parquet_name": request["parquet_name"],
             },
         )
     manifest = {
-        "manifest_schema_version": "qaq_fineweb_request_manifest_v1",
+        "manifest_schema_version": "qaq_hellaswag_request_manifest_v1",
         "protocol_version": PROTOCOL_VERSION,
         "dataset": dataset_metadata,
         "tokenizer": tokenizer_metadata,
         "selection_policy": {
-            "row_order": "sorted parquet shard order, first row_limit rows",
-            "document_partition": "document_partition(sha256(dataset_identity|split|normalized_text))",
-            "length_cells": [list(cell) for cell in length_cells],
+            "row_order": "parquet row order, bounded by row_limit",
+            "document_unit": "one source_id; ctx_a and ctx_b concatenated in ind order",
+            "excluded_fields": ["endings", "label"],
+            "document_partition": "document_partition(document_id)",
             "one_request_per_document": True,
-            "candidate_cell": "sha256(document_id) modulo four registered length cells",
+            "candidate_cell": "sha256(document_id) modulo four short length cells",
             "candidate_order": "selection_sha256 ascending within partition and cell",
             "partition_quotas": PARTITION_QUOTAS,
         },
@@ -293,20 +315,28 @@ def main() -> None:
     parquet_paths = sorted(Path(path).resolve() for path in args.parquet_shards)
     if not parquet_paths or any(not path.is_file() for path in parquet_paths):
         raise FileNotFoundError("Every --parquet_shards path must be an existing file")
+
     tokenizer_path = args.tokenizer_path or args.ap_model_path
     tokenizer = AutoTokenizer.from_pretrained(
-        tokenizer_path, trust_remote_code=True, local_files_only=args.local_files_only
+        tokenizer_path,
+        trust_remote_code=True,
+        local_files_only=args.local_files_only,
     )
     dataset_metadata = canonical_metadata(parquet_paths, args.row_limit)
     tokenizer_metadata = tokenizer_file_manifest(tokenizer_path)
-    length_cells = SHORT_TRANSFER_LENGTH_CELLS if args.length_profile == "short_transfer" else LENGTH_CELLS
     requests, selection_metadata = collect_candidates(
-        tokenizer, parquet_paths, args.row_limit, args.candidate_multiplier, length_cells
+        tokenizer,
+        parquet_paths,
+        args.row_limit,
+        args.candidate_multiplier,
     )
-    manifest = build_manifest(requests, dataset_metadata, tokenizer_metadata, length_cells)
+    manifest = build_manifest(requests, dataset_metadata, tokenizer_metadata)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    atomic_write_json(output_dir / "manifest.json", {**manifest, "selection": selection_metadata})
+    atomic_write_json(
+        output_dir / "manifest.json",
+        {**manifest, "selection": selection_metadata},
+    )
 
     if args.manifest_only:
         print(json.dumps({
@@ -323,7 +353,7 @@ def main() -> None:
         raise ValueError(f"--bits {sorted(args.bits)} do not match checkpoint bits {bits}")
     device = torch.device(args.device)
     if device.type != "cuda" or not torch.cuda.is_available():
-        raise RuntimeError("FineWeb collection requires CUDA")
+        raise RuntimeError("HellaSwag collection requires CUDA")
     if not os.environ.get("CUDA_VISIBLE_DEVICES"):
         raise RuntimeError("Set CUDA_VISIBLE_DEVICES explicitly")
     dtype = {"float16": torch.float16, "bfloat16": torch.bfloat16}[args.torch_dtype]
@@ -358,19 +388,24 @@ def main() -> None:
             layer_group_size=args.profile_layer_group_size,
             device=device,
         )
-        dataset_metadata_for_record = {
-            **dataset_metadata,
-            "fingerprint": dataset_metadata["fingerprint"],
-        }
         record = make_collection_record(
             raw,
             request,
             manifest["manifest_sha256"],
-            dataset_metadata_for_record,
+            dataset_metadata,
         )
-        record["source"]["source_row_id_sha256"] = request["source_row_id_sha256"]
-        record["source"]["parquet_name"] = request["parquet_name"]
-        for key in ("prompt_token_sha256", "continuation_token_sha256", "request_token_sha256"):
+        for key in (
+            "source_id_sha256",
+            "source_row_id_sha256",
+            "source_row_count",
+            "parquet_name",
+        ):
+            record["source"][key] = request[key]
+        for key in (
+            "prompt_token_sha256",
+            "continuation_token_sha256",
+            "request_token_sha256",
+        ):
             request[key] = record[key]
         raw_records.append(record)
 
@@ -405,7 +440,7 @@ def main() -> None:
     atomic_write_json(
         output_dir / "summary.json",
         {
-            "schema_version": "qaq_fineweb_request_summary_v1",
+            "schema_version": "qaq_hellaswag_request_summary_v1",
             "validation_status": "REAL_GPU_REQUEST_DEMAND",
             "manifest_sha256": manifest["manifest_sha256"],
             "aggregate": aggregate_records(raw_records),
@@ -422,4 +457,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
