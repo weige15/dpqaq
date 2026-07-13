@@ -1,104 +1,149 @@
 # Performance Profile
 
-## Benchmark Command
+## Executive Summary
 
-Target: repeated CUDA-synchronized generation benchmark for QAQ DP guard runtime modes on the Any-Precision Llama 3.1 8B checkpoint.
+The native-continuation frozen-stream benchmark is complete for six policies,
+three deterministic arrival traces, ten measured repeats, and 192 held-out
+requests per trace. The stream contains 96 native 32-token and 96 native
+128-token continuations, plus 27 deliberately uncertain held-out requests per
+trace. All timed model work used real CUDA execution with one warmup,
+CUDA synchronization before and after measured batches, and continuous
+nvidia-smi sampling.
 
-Artifact: `artifacts/qaq_dp_guard_benchmark_20260708_230117`
+Across traces, uncertainty-aware fallback is the strongest adaptive policy:
+26.41 generated tokens/s, 286.7/558.7 ms p50/p95 latency, 5.807 effective
+bits, and 0.471% route-level quality violations. Fixed-high remains the
+safety/throughput ceiling at 112.29 tokens/s and zero violations. These are
+route-level precision-audit results, not task accuracy or perplexity results.
 
-Follow-up phase-timer artifact: `artifacts/qaq_phase_timers_20260709_011516`
+## Scope and Baseline
 
-Command:
+The benchmark compares fcfs, scalar_predicted, oracle_profile,
+predicted_profile, uncertainty_fallback, and fixed_high using identical
+request IDs, prompt windows, continuation lengths, arrival traces, model
+artifacts, and predictor seed. Profile policies use the existing
+QAQDPLLM_Linear.batch_policy="max" path for multi-request batches;
+FCFS and fixed-high use grouped execution. The installed Any-Precision CUDA
+kernel enforces M <= 8, so --max_batch_size 8 is the largest valid batch in
+this environment.
 
-```bash
-OUT=artifacts/qaq_dp_guard_benchmark_$(date +%Y%m%d_%H%M%S)
-mkdir -p "$OUT"
-export CUDA_VISIBLE_DEVICES=0
-export AP_MODEL_PATH='/nfs/home/s314511048/dpqaq/cache/packed/anyprec-(Meta-Llama-3.1-8B)-w6_orig3-gc1-c4_s100_blk512'
-export ROUTER_CHECKPOINT='./checkpoints/qaq_router_llama31_8b_th005.pt'
-export ESTIMATOR_RESULTS='./estimator_private_values/anyprec-(Meta-Llama-3.1-8B)-w6_orig3-gc1-c4_s100_blk512/finetuned_max6.0_3b-6b_th_pb_train_0.01_1.0_1ep_targ4.5b_init_0-40_adam'
-/usr/bin/time -v python scripts/benchmark_qaq_modes.py   --ap_model_path "$AP_MODEL_PATH"   --router_checkpoint "$ROUTER_CHECKPOINT"   --estimator_results "$ESTIMATOR_RESULTS"   --bits 3 4 5 6   --modes fixed_low fixed_high qaq dp_threshold_only mlp_multibit_dp_guard dp_threshold   --prompt "Explain mixed-precision inference in one sentence."   --max_new_tokens 16   --warmup 1   --repeat 3   --device cuda   --confidence_threshold 0.6   --output_json "$OUT/benchmark.json"   2>&1 | tee "$OUT/run.log"
-```
-
-Environment recorded in `manifest.txt`: commit `681beb1ec2756c335d68e13e0073694ee1da3426`, CUDA_VISIBLE_DEVICES=0, PyTorch `2.4.0+cu124`, GPU `NVIDIA GeForce RTX 3090`, driver `580.159.03`, CUDA reported by `nvidia-smi` as `13.0`. Prompt count was 1, prompt token count was 11, `max_new_tokens=16`, warmup count was 1, repeat count was 3.
-
-Phase-timer follow-up command, run on 2026-07-09 with commit `a9a3f44f68fc487f5ebf9a7c5fb5cfb68d02b945` plus local timer changes:
-
-```bash
-CUDA_VISIBLE_DEVICES=0 python scripts/benchmark_qaq_modes.py --ap_model_path /nfs/home/s314511048/dpqaq/cache/packed/anyprec-\(Meta-Llama-3.1-8B\)-w6_orig3-gc1-c4_s100_blk512 --router_checkpoint ./checkpoints/qaq_router_llama31_8b_th005.pt --estimator_results ./estimator_private_values/anyprec-\(Meta-Llama-3.1-8B\)-w6_orig3-gc1-c4_s100_blk512/finetuned_max6.0_3b-6b_th_pb_train_0.01_1.0_1ep_targ4.5b_init_0-40_adam --bits 3 4 5 6 --modes mlp_multibit_dp_guard --prompt "Explain mixed-precision inference in one sentence." --max_new_tokens 16 --warmup 1 --repeat 3 --device cuda --confidence_threshold 0.6 --output_json artifacts/qaq_phase_timers_20260709_011516/benchmark.json
-```
-
-## Baseline Result
-
-No reliable repeated benchmark baseline was found. The closest prior artifact is `artifacts/qaq_dp_guard_sanity_20260708_223930`, but it was a single-run sanity check and is not a statistically comparable benchmark.
+The real inputs are the preregistered WikiText-2 and C4 held-out request
+collection, the packed Any-Precision Llama 3.1 8B model, the QAQ router
+checkpoint, and the estimator artifacts. Arrival seeds are 101, 202, and 303;
+the stream hashes are recorded in each JSON artifact. Predictor seed is 17 and
+confidence threshold is 0.6.
 
 ## Current Result
 
-All measured modes produced finite logits. The benchmark wrote raw per-repeat timings and aggregate stats to `artifacts/qaq_dp_guard_benchmark_20260708_230117/benchmark.json`.
+### Native 32/128-token frozen stream
 
-| Mode | p50 latency (s) | p95 latency (s) | Mean tokens/s | Effective bits mean | Notes |
-|---|---:|---:|---:|---:|---|
-| `fixed_low` | 0.4995 | 0.5068 | 31.96 | 4.269 | QAQ wrapper, prefill at high precision and decode at low precision |
-| `fixed_high` | 0.4986 | 0.5002 | 32.18 | 6.000 | QAQ wrapper, high precision baseline |
-| `qaq` | 2.9914 | 3.0077 | 5.35 | 5.468 | 3075 confidence fallbacks over 3 repeats |
-| `dp_threshold_only` | 2.0166 | 2.0199 | 7.93 | 5.095 | 10080 DP threshold decisions, 4227 high-bit decisions |
-| `mlp_multibit_dp_guard` | 3.9109 | 3.9223 | 4.09 | 5.478 | 3075 confidence fallbacks and 147 DP guard triggers |
-| `dp_threshold` | 1.0434 | 1.0452 | 15.35 | 4.411 | Original DP-LLM wrapper baseline |
+Run configuration:
 
-The process-level `/usr/bin/time -v` output reported 1:19.07 wall-clock time for the whole benchmark command, 75.09 user CPU seconds, 12.07 system CPU seconds, 110% CPU utilization, and 9,572,424 KB maximum resident set size.
+    CUDA_VISIBLE_DEVICES=<free-gpu> python scripts/benchmark_qaq_profile_batching.py \
+      --collection_dir artifacts/qaq-request-demand-preregistered-v1 \
+      --analysis_json artifacts/qaq-request-demand-preregistered-v1-analysis/analysis.json \
+      --ap_model_path cache/packed/anyprec-(Meta-Llama-3.1-8B)-w6_orig3-gc1-c4_s100_blk512 \
+      --router_checkpoint checkpoints/qaq_router_llama31_8b_th005.pt \
+      --estimator_results estimator_private_values/anyprec-(Meta-Llama-3.1-8B)-w6_orig3-gc1-c4_s100_blk512/finetuned_max6.0_3b-6b_th_pb_train_0.01_1.0_1ep_targ4.5b_init_0-40_adam \
+      --tokenizer_path cache/packed/anyprec-(Meta-Llama-3.1-8B)-w6_orig3-gc1-c4_s100_blk512 \
+      --datasets wikitext2 c4_new --request_limit 0 --min_uncertain_requests 1 \
+      --max_new_tokens 128 --arrival_rate 1000 --arrival_seed 101 \
+      --predictor_seed 17 --policies <policy> --max_batch_size 8 \
+      --max_wait_ms 50 --warmup_batches 1 --repeat 10 \
+      --confidence_threshold 0.6 --device cuda:0 --local_files_only \
+      --output_json /tmp/qaq-profile-native128-r10-b8-seed101-<policy>.json
 
-The phase-timer follow-up measured only `mlp_multibit_dp_guard` with 1 warmup, 3 repeats, and 16 generated tokens per repeat. It produced finite logits and wrote raw stats to `artifacts/qaq_phase_timers_20260709_011516/benchmark.json`. The measured p50 latency was 5.1616 s, p95 latency was 5.1891 s, mean throughput was 3.13 tokens/s, effective bits mean was 5.478, average selected bit was 5.607, with 3,075 confidence fallbacks and 147 DP guard triggers over 17,472 routed linear-token operations. Because CUDA event phase timing is enabled inside every guarded linear call, this run should be used for internal attribution rather than direct speed comparison against the no-timer mode benchmark.
+The command was repeated with arrival seeds 202 and 303, one policy process
+per GPU, and a continuous nvidia-smi sampler writing a corresponding
+-gpu.csv file. The seed-303 fixed-high process initially encountered an
+external process occupying GPU 5; it was rerun with the identical configuration
+on free GPU 6 and is included as fixed_high-retry.
+
+Values below are means across the three arrival traces; the JSON artifacts
+retain the per-trace values and standard deviations. Latency, TTFT, and TPOT
+are milliseconds; padding is the profile-padding fraction; predictor is CPU
+predictor-consumption overhead per request.
+
+| Policy | p50 / p95 latency | TTFT p50 | TPOT p50 | Requests/s | Tokens/s | Effective bits | Occupancy | Padding | Quality violation | Predictor ms | Fallback / guard | Uncertainty fallback |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| fcfs | 488943 / 1101993 | 444651 | 496.8 | 0.2112 | 16.90 | 5.1382 | 1.0000 | 0.0000 | 4.2705% | 0.0000 | 35.5524% / 1.2142% | 0.0000% |
+| scalar_predicted | 316165 / 596381 | 286651 | 295.6 | 0.3123 | 24.99 | 5.7800 | 1.0000 | 0.0058 | 0.5283% | 0.6780 | 35.8953% / 1.2111% | 0.0000% |
+| oracle_profile | 309979 / 580342 | 283671 | 296.0 | 0.3151 | 25.21 | 5.7800 | 1.0000 | 0.0095 | 0.5283% | 3.0818 | 35.8953% / 1.2111% | 0.0000% |
+| predicted_profile | 314111 / 593250 | 286777 | 298.1 | 0.3118 | 24.94 | 5.7800 | 1.0000 | 0.0049 | 0.5283% | 2.5473 | 35.8953% / 1.2111% | 0.0000% |
+| uncertainty_fallback | 286738 / 558688 | 249102 | 299.7 | 0.3301 | 26.41 | 5.8073 | 0.8677 | 0.0036 | 0.4715% | 2.2868 | 31.0330% / 1.0469% | 14.0625% |
+| fixed_high | 70149 / 131248 | 64644 | 58.2 | 1.4037 | 112.29 | 6.0000 | 1.0000 | 0.0000 | 0.0000% | 0.0000 | 0.0000% / 0.0000% | 0.0000% |
+
+The quality violation is the QAQPrecisionAuditor route-decision
+underprecision rate: the fraction of real output-error oracle decisions where
+the executed bit is below the smallest safe candidate at the configured
+threshold. It is not a task-level quality metric. Each audit made 25,417,728
+route decisions, except uncertainty fallback (25,331,712 because fallback
+requests are audited through the fixed-high safety lane). Mean violation counts
+were 1,085,474 FCFS, 134,271 for scalar/oracle/predicted, 119,566 for
+uncertainty fallback, and zero for fixed-high.
 
 ## Hotspots
 
-Mode-level timing shows the runtime overhead is concentrated in dynamic routing paths rather than the fixed precision paths. `qaq` is about 6.0x slower than `fixed_high` by p50 latency. `dp_threshold_only` is about 4.0x slower than `fixed_high`. `mlp_multibit_dp_guard` is about 7.8x slower than `fixed_high` and about 1.3x slower than plain `qaq`.
+FCFS is dominated by queueing and long mixed-length batches in the high-load
+arrival trace. Its p95 latency is 1.10 million ms, compared with 0.56--0.60
+million ms for adaptive profile policies. Profile-aware execution improves
+throughput by avoiding per-row profile fragmentation, but it does not remove
+the substantial QAQ router, estimator, grouping, and dequantized matmul cost.
 
-The combined guard mode performs both MLP router inference and DP estimator/threshold work, and its p50 latency is the largest measured value. The phase-timer follow-up shows router time is the largest measured internal phase for `mlp_multibit_dp_guard`, followed by grouping and dequantized matmul. No kernel-level profiler was run in this pass.
+The uncertainty lane reduces fallback and DP-guard rates while increasing
+effective bits from 5.7800 to 5.8073. That tradeoff improves mean throughput
+and route-level violation rate on these traces, but the lower batch occupancy
+(0.8677) shows that safety routing also fragments batches.
 
 ## Time Breakdown
 
-Generation timing excludes tokenization and uses CUDA synchronization before and after each measured `generate` call. Each mode used 1 warmup and 3 measured repeats, generating 16 new tokens per repeat.
-
-The fastest measured modes were `fixed_high` and `fixed_low` at roughly 0.50 s p50. The original DP-LLM threshold baseline was 1.04 s p50. QAQ MLP routing was 2.99 s p50. QAQ threshold-only routing was 2.02 s p50. QAQ MLP plus DP guard was 3.91 s p50.
-
-`QAQDPLLM_Linear` phase-timer totals from the 16-token, 3-repeat guarded follow-up were:
-
-| Phase | CUDA event total (ms) | Wall total (ms) | Count |
-|---|---:|---:|---:|
-| router | 5,578.72 | 5,747.75 | 10,080 |
-| estimator | 766.18 | 1,081.51 | 10,080 |
-| grouping | 1,743.14 | 2,217.04 | 20,160 |
-| dequant_matmul | 1,160.92 | 1,334.34 | 10,080 |
-| total | 13,578.90 | 13,809.73 | 10,080 |
-
-Using CUDA event time, router work accounts for about 41.1% of the measured guarded linear total, grouping about 12.8%, dequantized matmul about 8.6%, and estimator work about 5.6%. The remaining measured total includes uninstrumented work inside the guarded linear path and nesting/measurement overhead.
-
-CUDA event timings measure queued GPU work; wall timings also include Python launch overhead and CPU-side synchronization such as grouping decisions. Model loading, JSON writing, and manifest creation were included in the process wall time but not in per-mode latency measurements.
+Each measured batch used synchronized CUDA barriers around cached prefill and
+decode. Warmups were excluded. TTFT includes queue delay, synchronized
+prefill, and first-token selection. TPOT is synchronized decode time divided
+by decode forwards after prefill. Tokenization, model loading, JSON writing,
+and quality auditing were outside the timed region. Predictor overhead is the
+CPU cost of consuming held-out predictor outputs and applying scheduler
+decisions; predictor fitting is not included.
 
 ## Memory Breakdown
 
-Peak CUDA memory reported by the benchmark script was stable across modes. QAQ fixed and MLP modes reported about 7.28 GiB max allocated and 7.35 GiB max reserved. QAQ DP threshold modes reported about 7.33 GiB max allocated and 7.40 GiB max reserved. The original DP threshold baseline reported about 7.33 GiB max allocated and 7.38 GiB max reserved.
-
-The `/usr/bin/time -v` maximum resident set size was about 9.13 GiB. No CUDA out-of-memory or host swapping was observed.
+The benchmark used an RTX 3090 with 24 GiB VRAM and --max_batch_size 8.
+The continuous sampler observed a maximum resident GPU memory of 24,120 MiB
+across the benchmark processes. GPU 5 was externally occupied during the
+failed seed-303 fixed-high attempt; no external process was terminated.
 
 ## I/O Breakdown
 
-The benchmark loaded the AP model checkpoint, router checkpoint (`15M`), and estimator files: `jl_d.pt` (`56M`), `linear_reg_d.pt` (`22K`), `max_mem_dict.pt` (`3.0K`), and `T_d.pt` (`58K`). Runtime output files were `benchmark.json` (`2.0M`), `run.log` (`121K`), and `manifest.txt` (`5.9K`).
-
-The `/usr/bin/time -v` output reported zero major page faults and 14,760 filesystem output blocks. File I/O was visible during model and estimator loading, but per-mode generation timing did not include explicit I/O work beyond normal runtime logging.
+All model, tokenizer, router, estimator, and held-out data inputs were local.
+Result JSON and sampler CSV files were written under /tmp; no generated
+checkpoints, datasets, or benchmark logs were added to the repository. The
+18 result JSON files and 18 sampler files are reproducible from the command
+above by substituting the three arrival seeds and six policies.
 
 ## GPU Utilization
 
-The run used GPU 0, an NVIDIA GeForce RTX 3090 with 24 GiB VRAM. The manifest `nvidia-smi` snapshot after completion showed no running processes and 1 MiB used, so it does not capture active utilization during the measured repeats. CUDA memory telemetry from the benchmark script indicates peak reserved memory was about 7.35-7.40 GiB.
-
-The benchmark did not sample GPU utilization during the active generation windows and did not run `nsys`, `ncu`, or `torch.profiler`, so GPU-bound versus CPU/synchronization-bound attribution remains uncertain.
+Continuous nvidia-smi sampling covered all 18 policy/trace runs with 120,225
+samples. Sampled GPU utilization was mean 38.53%, median 23%, and p95 100%;
+the low mean reflects idle gaps between batches and concurrent sampling across
+the long FCFS trace. The sampler's per-file row counts ranged from 85 to
+13,090, with observed durations from 98.44 s to 14,710.27 s. This is
+device-level telemetry, not a kernel profiler attribution.
 
 ## Bottleneck Hypotheses
 
-1. Hypothesis: per-token QAQ MLP routing and grouped per-bit execution dominate `qaq` latency. Evidence: `qaq` p50 latency was 2.9914 s versus 0.4986 s for `fixed_high`, while effective bits were lower than fixed high. Confidence: High. Next measurement: use `torch.profiler` around one QAQ repeat to split router MLP, estimator, dequantization, matmul, and Python grouping overhead. Hand off to `optimization-diagnosis`: yes.
+1. The primary serving bottleneck is QAQ dynamic routing plus queueing, not
+   the fixed-high CUDA path. Evidence: adaptive policies deliver 16.90--26.41
+   tokens/s versus 112.29 for fixed-high, and FCFS has the largest queue-delay
+   tail. Confidence: high.
 
-2. Hypothesis: DP threshold estimator work in the QAQ wrapper is materially slower than the original DP-LLM threshold implementation. Evidence: `dp_threshold_only` p50 was 2.0166 s while original `dp_threshold` p50 was 1.0434 s. Confidence: Medium. Next measurement: profile estimator calls and compare QAQ synchronous estimator code against DP-LLM async residual estimator behavior. Hand off to `optimization-diagnosis`: yes.
+2. Profile-aware scheduling reduces route fragmentation but still pays the
+   router/estimator and grouped execution overhead. Evidence: predicted and
+   oracle profiles are close in throughput and quality, while their padding
+   fractions remain below 1%. Confidence: medium.
 
-3. Hypothesis: `mlp_multibit_dp_guard` is dominated by router and grouped execution overhead more than by the DP estimator itself. Evidence: guarded no-timer p50 was 3.9109 s, slower than both `qaq` at 2.9914 s and `dp_threshold_only` at 2.0166 s; it performed 147 DP guard triggers and 10,080 threshold decisions across 3 repeats. The repeated phase-timer follow-up measured 5,578.72 ms CUDA time in router work, 766.18 ms in estimator work, 1,743.14 ms in grouping, and 1,160.92 ms in dequant/matmul across the guarded run. Confidence: High. Next measurement: run `torch.profiler` or `nsys` on one guarded repeat to validate whether event-level phase timing matches kernel-level attribution and to identify the exact router kernels and Python synchronization sites. Hand off to `optimization-diagnosis`: yes.
+3. The uncertainty fallback lane is promising but needs a less saturated
+   arrival regime to separate scheduler fragmentation from safety overhead.
+   Evidence: it has the best adaptive throughput and lowest adaptive violation
+   rate here, but occupancy falls to 0.8677. Confidence: medium.
 
-Recommendation: run `optimization-diagnosis` next with `torch.profiler` or `nsys` focused first on the `mlp_multibit_dp_guard` router and grouping phases, because the new internal phase timers identify router work as the largest measured component but do not yet provide kernel-level attribution.
+Recommendation: next run a synchronized low-load/medium-load arrival sweep with the same native stream and continuous sampling, then use torch.profiler or nsys on one representative repeat to split QAQ router, estimator, grouping, and dequantized matmul costs before optimizing kernels.
