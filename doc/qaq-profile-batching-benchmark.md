@@ -1,86 +1,89 @@
 # QAQ Profile-Aware Batching Benchmark
 
-scripts/benchmark_qaq_profile_batching.py replays a frozen held-out request
-stream through six policies:
-
-- fcfs: arrival/deadline dynamic batching with per-row grouped execution.
-- scalar_predicted: buckets requests by predicted scalar effective bits.
-- oracle_profile: groups by observed QAQ profile from frozen request records.
-- predicted_profile: groups by held-out predicted profile.
-- uncertainty_fallback: routes calibrated uncertain requests to fixed-high
-  and groups the remaining requests by predicted profile.
-- fixed_high: fixed-high safety baseline with FCFS batching.
+`scripts/benchmark_qaq_profile_batching.py` replays a frozen held-out request
+stream through six policies: `fcfs`, `scalar_predicted`, `oracle_profile`,
+`predicted_profile`, `uncertainty_fallback`, and `fixed_high`.
 
 All policies use identical request IDs, prompt windows, native continuation
-lengths, arrival timestamps, candidate bits, and model artifacts. The profile
-policies use the existing QAQDPLLM_Linear.batch_policy="max" path for
-multi-request batches. FCFS and fixed-high use grouped execution. The installed
-Any-Precision CUDA kernel caps the batch dimension at 8, so the benchmark uses
---max_batch_size 8.
+lengths, arrival timestamps, candidate bits, model artifacts, and predictor
+seed. Each request trace contains 192 requests: 96 native 32-token and 96
+native 128-token continuations, including 27 deliberately uncertain held-out
+requests. The Any-Precision CUDA kernel caps the batch dimension at 8, so the
+benchmark uses `--max_batch_size 8`.
 
-## Reproducible run
+## Completed low/medium sweep
 
-The completed experiment used:
+The current sweep covers arrival rates 100 and 300 requests/s, arrival seeds
+101/202/303, one warmup batch, two measured repeats, native
+`--max_new_tokens 128`, full route-quality audits, and the real local model and
+Any-Precision CUDA kernels. The six policies at each rate/seed share one
+stream hash:
 
-- 192 requests per trace: 48 each for prompt/continuation cells
-  (128,32), (128,128), (512,32), and (512,128).
-- Native 32- and 128-token continuations; --max_new_tokens 128.
-- Arrival rate 1000 with seeds 101, 202, and 303.
-- Predictor seed 17, 27 deliberately uncertain held-out requests per trace.
-- One warmup batch and ten measured repeats per policy/trace.
-- Synchronized CUDA timing around every manual cached prefill/decode batch.
-- Continuous nvidia-smi sampling to a per-run CSV.
+| Rate | Seed 101 stream hash | Seed 202 stream hash | Seed 303 stream hash |
+|---:|---|---|---|
+| 100 | `5787a9d7...f21462` | `6171ba79...127542` | `d9fabf35...d1d8b` |
+| 300 | `fabf2506...810c49` | `d59f3990...669f70` | `2181413e...24a2cf` |
 
-Run from the repository root on a free lab GPU:
+The JSON results are under
+`/tmp/qaq-profile-native128-r2-b8-rate{100,300}-seed{101,202,303}-*`.
+Quality auditing is a separate synchronized CUDA replay, excluded from
+latency/throughput timing. One overlapping seed-303 medium-rate attempt was
+discarded; clean isolated FCFS and uncertainty reruns produced the final
+artifacts.
 
-    CUDA_VISIBLE_DEVICES=0 python scripts/benchmark_qaq_profile_batching.py \
-      --collection_dir artifacts/qaq-request-demand-preregistered-v1 \
-      --analysis_json artifacts/qaq-request-demand-preregistered-v1-analysis/analysis.json \
-      --ap_model_path cache/packed/anyprec-(Meta-Llama-3.1-8B)-w6_orig3-gc1-c4_s100_blk512 \
-      --router_checkpoint checkpoints/qaq_router_llama31_8b_th005.pt \
-      --estimator_results estimator_private_values/anyprec-(Meta-Llama-3.1-8B)-w6_orig3-gc1-c4_s100_blk512/finetuned_max6.0_3b-6b_th_pb_train_0.01_1.0_1ep_targ4.5b_init_0-40_adam \
-      --tokenizer_path cache/packed/anyprec-(Meta-Llama-3.1-8B)-w6_orig3-gc1-c4_s100_blk512 \
-      --datasets wikitext2 c4_new --request_limit 0 --min_uncertain_requests 1 \
-      --max_new_tokens 128 --arrival_rate 1000 --arrival_seed 101 \
-      --predictor_seed 17 --policies fcfs scalar_predicted oracle_profile \
-      predicted_profile uncertainty_fallback fixed_high --max_batch_size 8 \
-      --max_wait_ms 50 --warmup_batches 1 --repeat 10 \
-      --confidence_threshold 0.6 --device cuda:0 --local_files_only \
-      --output_json /tmp/qaq-profile-native128-r10-b8-seed101-all.json
-
-For isolated policy runs, pass one value to --policies. Replace
---arrival_seed with 202 and 303 for the other traces. The JSON records the
-exact stream hash, request IDs, arrival timestamps, uncertain request IDs,
-warmup/repeat settings, CUDA environment, and per-policy measurements.
-
-The seed-303 fixed-high process was retried on free GPU 6 after an initial
-attempt on GPU 5 hit an out-of-memory condition caused by an unrelated process
-already using that GPU. The retry used the same command and stream.
+A prior high-load experiment used the same six policies, arrival seeds
+101/202/303, ten measured repeats, and rate 1000; its summarized results remain
+in `doc/performance-profile.md`.
 
 ## Metrics and quality definition
 
-The JSON reports p50/p95/p99 end-to-end latency, TTFT, TPOT, queue delay,
-requests/sec, generated tokens/sec, token-slot throughput, request and prompt
-occupancy, predictor/scheduler overhead, profile padding, effective bits,
-average selected bit, per-layer bit histograms, confidence fallbacks, DP guard
-triggers, uncertainty fallback rate, and quality violations.
+The JSON reports p50/p95/p99 latency, TTFT, TPOT, queue delay, requests/sec,
+generated tokens/sec, token-slot throughput, request and prompt occupancy,
+predictor/scheduler overhead, profile padding, effective bits, average
+selected bit, per-layer histograms, confidence fallbacks, DP guard triggers,
+uncertainty fallback rate, and quality violations.
 
-quality_violation_rate is the QAQPrecisionAuditor route-decision
+`quality_violation_rate` is the QAQPrecisionAuditor route-decision
 underprecision rate: real low-bit/reference-bit output-error labels determine
 the smallest safe candidate bit, and the metric counts decisions where the
 executed bit is lower. It is not task accuracy or perplexity. Quality auditing
 is a separate CUDA-backed replay and is excluded from timed latency and
 throughput.
 
-profile_padding_bits is the mean component-wise padding from each request's
-scheduler signal to the batch maximum. predictor_overhead_ms measures
-consuming the held-out predictor outputs and applying bucket/fallback
+`profile_padding_fraction` is the mean component-wise padding from each
+request's scheduler signal to the batch maximum. `predictor_overhead_ms`
+measures consuming held-out predictor outputs and applying bucket/fallback
 decisions; predictor training is not timed.
 
-## Output files
+## Task-level quality evaluation
 
-The benchmark writes the JSON requested by --output_json. The experiment
-also captured per-run sampler CSVs under /tmp with the columns emitted by
-nvidia-smi: timestamp, physical GPU index, model, memory used/total, GPU and
-memory utilization, and power. The 18 native experiment JSONs and 18 sampler
-files are intentionally outside the repository.
+`scripts/evaluate_qaq_heldout.py` was run on 16 held-out WikiText2 windows and
+16 held-out C4 windows, each with context length 512 and 8,176 scored target
+tokens. This is teacher-forced perplexity, complementary to the request-level
+route violation audit:
+
+| Dataset | Mode | Perplexity | Delta vs fixed-high | Effective bits | Fallback | DP guard |
+|---|---|---:|---:|---:|---:|---:|
+| WikiText2 | fixed_low | 12.7770 | +3.2600 | 3.0000 | 0.000% | 0.000% |
+| WikiText2 | dp_threshold_only | 9.8755 | +0.3586 | 4.4103 | 0.000% | 0.000% |
+| WikiText2 | mlp_multibit | 9.6590 | +0.1420 | 5.1828 | 42.053% | 0.000% |
+| WikiText2 | mlp_multibit_dp_guard | 9.6225 | +0.1055 | 5.1958 | 42.053% | 1.206% |
+| WikiText2 | fixed_high | 9.5170 | +0.0000 | 6.0000 | 0.000% | 0.000% |
+| C4 | fixed_low | 15.0702 | +3.1779 | 3.0000 | 0.000% | 0.000% |
+| C4 | dp_threshold_only | 12.3132 | +0.4209 | 4.4490 | 0.000% | 0.000% |
+| C4 | mlp_multibit | 12.0831 | +0.1908 | 5.1148 | 37.261% | 0.000% |
+| C4 | mlp_multibit_dp_guard | 12.0455 | +0.1533 | 5.1287 | 37.261% | 1.496% |
+| C4 | fixed_high | 11.8923 | +0.0000 | 6.0000 | 0.000% | 0.000% |
+
+The current artifacts are `/tmp/qaq-task-quality-wikitext2-current.json` and
+`/tmp/qaq-task-quality-c4-current.json`; both report `REAL_GPU_HELDOUT`, finite
+logits, and the current repository commit.
+
+## Profiling
+
+Use `scripts/profile_qaq_phases.py` for a representative real CUDA batch. It
+writes a CUDA-only `torch.profiler` TensorBoard trace and a JSON containing
+synchronized CUDA-event totals for router, estimator, grouping, and dequantized
+matmul. CUDA-only tracing is intentional because CPU activity plus memory
+profiling caused unbounded profiler bookkeeping on this model; the JSON phase
+counters remain the attribution source.

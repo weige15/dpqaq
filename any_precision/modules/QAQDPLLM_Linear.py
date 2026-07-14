@@ -403,11 +403,13 @@ class QAQDPLLM_Linear(nn.Module):
 
     @contextmanager
     def _record_phase(self, phase, reference_tensor):
-        if not self._should_time_phases(reference_tensor):
+        should_record = self._should_time_phases(reference_tensor)
+        if not should_record:
             yield
             return
 
         wall_start = time.perf_counter()
+        profiler_range = torch.profiler.record_function(f"qaq.{phase}")
         use_cuda_events = torch.cuda.is_available() and reference_tensor.device.type == "cuda"
         start_event = None
         end_event = None
@@ -418,7 +420,8 @@ class QAQDPLLM_Linear(nn.Module):
             start_event.record(stream)
 
         try:
-            yield
+            with profiler_range:
+                yield
         finally:
             if use_cuda_events:
                 end_event.record(torch.cuda.current_stream(reference_tensor.device))
