@@ -2,8 +2,7 @@
 
 ## Benchmark Command
 
-The low/medium sweep used the existing real CUDA benchmark path with the same
-frozen held-out request stream for every policy:
+The final low/medium sweep used the existing real-CUDA benchmark path:
 
     CUDA_VISIBLE_DEVICES=<free-gpu> python scripts/benchmark_qaq_profile_batching.py \
       --collection_dir artifacts/qaq-request-demand-preregistered-v1 \
@@ -15,88 +14,93 @@ frozen held-out request stream for every policy:
       --datasets wikitext2 c4_new --request_limit 0 --min_uncertain_requests 1 \
       --max_new_tokens 128 --arrival_rate <100-or-300> --arrival_seed <101-or-202-or-303> \
       --predictor_seed 17 --policies <policy> --max_batch_size 8 \
-      --max_wait_ms 50 --warmup_batches 1 --repeat 2 \
+      --max_wait_ms 50 --warmup_batches 1 --repeat 10 \
       --confidence_threshold 0.6 --device cuda:0 --local_files_only \
-      --output_json /tmp/qaq-profile-native128-r2-b8-rate<rate>-seed<seed>-<policy>.json
+      --output_json /tmp/qaq-profile-native128-r10-b8-rate<rate>-seed<seed>-<policy>.json
 
-The 36 completed runs cover rates 100 and 300 requests/s, arrival seeds
-101/202/303, six policies, one warmup, and two measured repeats. Each trace
-contains 192 requests: 96 native 32-token and 96 native 128-token
-continuations, including 27 deliberately uncertain held-out requests. Every
-policy at a given rate and seed reports the same stream hash. Timing used
-CUDA synchronization before and after cached prefill/decode batches. Quality
-auditing was a separate synchronized CUDA replay and was excluded from timed
-latency and throughput. Continuous `nvidia-smi` sampling ran during the
-seed-101 rate-100/rate-300 waves and the seed-202/303 rate-100 waves; the
-isolated seed-202/303 rate-300 reruns have no dedicated sampler CSV.
+Benchmark provenance: repository commit `066c8e02d1520c7579361638ea76b53c4fa6995d`.
 
-Task-level quality evaluation used the real held-out evaluator on 16 WikiText2
-and 16 C4 windows of context length 512, scoring 8,176 target tokens per
-dataset:
+The final matrix contains 36 real-CUDA runs: rates 100 and 300 requests/s,
+arrival seeds 101/202/303, and six policies (`fcfs`, `scalar_predicted`,
+`oracle_profile`, `predicted_profile`, `uncertainty_fallback`, and
+`fixed_high`). Every trace contains 192 requests: 96 native 32-token and 96
+native 128-token continuations, including 27 deliberately uncertain held-out
+requests. Each policy at a given rate and seed has the same frozen-stream hash.
+There was one warmup batch and ten measured repeats. CUDA synchronization was
+used before and after each measured batch. Quality auditing was a separate
+synchronized CUDA replay and was excluded from timed latency and throughput.
 
-    CUDA_VISIBLE_DEVICES=0 python scripts/evaluate_qaq_heldout.py \
-      --ap_model_path <AP_MODEL_PATH> --router_checkpoint <ROUTER_CHECKPOINT> \
-      --estimator_results <ESTIMATOR_DIR> --tokenizer_path <TOKENIZER_PATH> \
-      --context_length 512 --dataset_start 0 --num_examples 16 \
-      --bits 3 4 5 6 --confidence_threshold 0.6 --fallback_bits 1 \
-      --device cuda:0 --dataset <wikitext2-or-c4> --output_json <JSON>
-
-Phase profiling used `scripts/profile_qaq_phases.py` with
-`torch.profiler.schedule(wait=0, warmup=1, active=1, repeat=1)` and a CUDA-only
-trace on a representative native-32 batch. The environment was PyTorch
-2.4.0+cu124 on an RTX 3090 with local model, router, estimator, tokenizer, and
-held-out data artifacts.
+The report below uses normal-approximate 95% CIs over 30 repeat-by-seed
+observations per rate and policy. Quality violation is audited once per
+artifact, so its CI uses the three independent arrival traces rather than
+pretending that the ten timing repeats are ten independent audits.
 
 ## Baseline Result
 
-The previously completed high-load baseline used rates of 1000 requests/s,
-arrival seeds 101/202/303, ten repeats, and the same six policies. Means across
-those three traces were:
+The fixed-high safety baseline is the fastest reference in both sweeps. At rate
+100 it reaches 0.7509 +/- 0.0282 requests/s and 60.074 +/- 2.255 generated
+tokens/s; at rate 300 it reaches 1.3185 +/- 0.0175 requests/s and
+105.478 +/- 1.403 tokens/s. It uses six effective bits and has zero audited
+route violations, confidence fallbacks, uncertainty fallbacks, and DP guards.
 
-| Policy | p50/p95 latency ms | TTFT p50 ms | TPOT p50 ms | Requests/s | Tokens/s | Effective bits | Occupancy | Quality violation |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| fcfs | 488943 / 1101993 | 444651 | 496.8 | 0.2112 | 16.90 | 5.1382 | 1.0000 | 4.2705% |
-| scalar_predicted | 316165 / 596381 | 286651 | 295.6 | 0.3123 | 24.99 | 5.7800 | 1.0000 | 0.5283% |
-| oracle_profile | 309979 / 580342 | 283671 | 296.0 | 0.3151 | 25.21 | 5.7800 | 1.0000 | 0.5283% |
-| predicted_profile | 314111 / 593250 | 286777 | 298.1 | 0.3118 | 24.94 | 5.7800 | 1.0000 | 0.5283% |
-| uncertainty_fallback | 286738 / 558688 | 249102 | 299.7 | 0.3301 | 26.41 | 5.8073 | 0.8677 | 0.4715% |
-| fixed_high | 70149 / 131248 | 64644 | 58.2 | 1.4037 | 112.29 | 6.0000 | 1.0000 | 0.0000% |
+The earlier rate-1000 ten-repeat baseline remains available in the repository
+history and is not mixed into the low/medium confidence intervals below.
 
 ## Current Result
 
-The following are means plus population standard deviation across arrival seeds
-101, 202, and 303. Latencies, TTFT, TPOT, and predictor overhead are
-milliseconds. Occupancy and profile padding are fractions. Fallback, guard, and
-quality violation are percentages. Quality violation is the route-level
-underprecision rate from `QAQPrecisionAuditor`, not task accuracy or
-perplexity.
+All latency, TTFT, and TPOT values are milliseconds. Each cell is mean +/- 95%
+CI; latency, TTFT, and TPOT show p50/p95. Quality violation is the
+route-level underprecision rate from `QAQPrecisionAuditor`, not task accuracy
+or perplexity.
 
 Rate 100 requests/s:
 
-| Policy | p50 | p95 | TTFT | TPOT | Requests/s | Tokens/s | Effective bits | Occupancy | Padding | Quality violation | Predictor ms | Fallback | Guard |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| fcfs | 794653±19270 | 1521060±13027 | 772874±20087 | 356.2±4.2 | 0.1198±0.0024 | 9.580±0.190 | 5.1396±0.0002 | 0.4366±0.0110 | 0.0000 | 4.467±0.028% | 0.000±0.000 | 0.000% | 1.230±0.002% |
-| scalar_predicted | 709118±85456 | 1328761±131510 | 684066±84478 | 305.1±30.6 | 0.1377±0.0126 | 11.017±1.010 | 5.7212±0.0063 | 0.4366±0.0110 | 0.0032±0.0001 | 0.916±0.052% | 0.766±0.010 | 0.000% | 1.228±0.004% |
-| oracle_profile | 735215±120314 | 1421690±232927 | 709288±106880 | 287.0±6.3 | 0.1381±0.0092 | 11.048±0.738 | 5.7212±0.0063 | 0.4366±0.0110 | 0.0056±0.0002 | 0.916±0.052% | 2.250±0.023 | 0.000% | 1.228±0.004% |
-| predicted_profile | 721269±109340 | 1403976±242404 | 707409±113110 | 284.6±1.8 | 0.1400±0.0112 | 11.198±0.893 | 5.7212±0.0063 | 0.4366±0.0110 | 0.0029±0.0001 | 0.916±0.052% | 2.106±0.007 | 0.000% | 1.228±0.004% |
-| uncertainty_fallback | 638732±14429 | 1229490±28117 | 619499±8408 | 282.3±6.9 | 0.1475±0.0052 | 11.802±0.414 | 5.7461±0.0076 | 0.3382±0.0068 | 0.0020±0.0001 | 0.882±0.085% | 2.197±0.065 | 14.063% | 1.083±0.004% |
-| fixed_high | 124177±7966 | 231374±9940 | 121003±6757 | 54.8±5.7 | 0.7873±0.0330 | 62.987±2.639 | 6.0000±0.0000 | 0.4366±0.0110 | 0.0000 | 0.000% | 0.000±0.000 | 0.000% | 0.000% |
+| Policy | Latency p50/p95 | TTFT p50/p95 | TPOT p50/p95 | Requests/s | Tokens/s | Quality violation |
+|---|---:|---:|---:|---:|---:|---:|
+| fcfs | 804441 +/- 9696 / 1543231 +/- 50872 | 782276 +/- 9802 / 1505907 +/- 49503 | 359.47 +/- 2.26 / 399.15 +/- 33.55 | 0.1188 +/- 0.0030 | 9.503 +/- 0.238 | 4.467 +/- 0.039% |
+| scalar_predicted | 677794 +/- 9513 / 1282453 +/- 16968 | 659358 +/- 10366 / 1250334 +/- 15644 | 293.28 +/- 1.76 / 315.01 +/- 7.44 | 0.1418 +/- 0.0022 | 11.343 +/- 0.176 | 0.916 +/- 0.072% |
+| oracle_profile | 672852 +/- 9494 / 1271886 +/- 16550 | 654721 +/- 10101 / 1239817 +/- 14950 | 291.94 +/- 1.84 / 310.24 +/- 6.60 | 0.1429 +/- 0.0022 | 11.433 +/- 0.177 | 0.916 +/- 0.072% |
+| predicted_profile | 669557 +/- 8789 / 1288890 +/- 38838 | 651222 +/- 9286 / 1252814 +/- 30877 | 292.17 +/- 1.94 / 321.80 +/- 32.64 | 0.1416 +/- 0.0035 | 11.328 +/- 0.281 | 0.916 +/- 0.072% |
+| uncertainty_fallback | 662354 +/- 9258 / 1286015 +/- 33077 | 645644 +/- 9117 / 1252188 +/- 26131 | 289.91 +/- 2.28 / 335.12 +/- 22.86 | 0.1408 +/- 0.0041 | 11.262 +/- 0.330 | 0.882 +/- 0.118% |
+| fixed_high | 130080 +/- 10173 / 244508 +/- 11638 | 127051 +/- 10135 / 239273 +/- 11650 | 54.54 +/- 1.20 / 65.77 +/- 10.11 | 0.7509 +/- 0.0282 | 60.074 +/- 2.255 | 0.000 +/- 0.000% |
 
 Rate 300 requests/s:
 
-| Policy | p50 | p95 | TTFT | TPOT | Requests/s | Tokens/s | Effective bits | Occupancy | Padding | Quality violation | Predictor ms | Fallback | Guard |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| fcfs | 424893±11206 | 815004±18920 | 389530±6899 | 368.5±1.6 | 0.2202±0.0047 | 17.616±0.377 | 5.1383±0.0001 | 0.8579±0.0250 | 0.0000 | 4.268±0.013% | 0.000±0.000 | 0.000% | 1.215±0.000% |
-| scalar_predicted | 359646±29580 | 686199±70110 | 339818±28218 | 309.8±35.7 | 0.2643±0.0231 | 21.144±1.848 | 5.7721±0.0016 | 0.8579±0.0250 | 0.0055±0.0000 | 0.584±0.012% | 0.501±0.022 | 0.000% | 1.212±0.001% |
-| oracle_profile | 340785±7995 | 652646±12886 | 312971±4213 | 292.2±3.8 | 0.2732±0.0063 | 21.854±0.503 | 5.7721±0.0016 | 0.8579±0.0250 | 0.0087±0.0001 | 0.584±0.012% | 1.669±0.068 | 0.000% | 1.212±0.001% |
-| predicted_profile | 336195±2529 | 637699±16355 | 309272±4528 | 282.5±0.9 | 0.2783±0.0060 | 22.260±0.482 | 5.7721±0.0016 | 0.8579±0.0250 | 0.0046±0.0001 | 0.584±0.012% | 1.451±0.013 | 0.000% | 1.212±0.001% |
-| uncertainty_fallback | 315187±6469 | 627631±24948 | 308913±8915 | 284.5±8.4 | 0.2835±0.0139 | 22.683±1.112 | 5.7983±0.0009 | 0.6219±0.0267 | 0.0029±0.0002 | 0.531±0.002% | 1.536±0.071 | 14.063% | 1.058±0.007% |
-| fixed_high | 71527±1062 | 137165±1566 | 65880±432 | 51.9±2.1 | 1.3176±0.0117 | 105.411±0.940 | 6.0000±0.0000 | 0.8579±0.0250 | 0.0000 | 0.000% | 0.000±0.000 | 0.000% | 0.000% |
+| Policy | Latency p50/p95 | TTFT p50/p95 | TPOT p50/p95 | Requests/s | Tokens/s | Quality violation |
+|---|---:|---:|---:|---:|---:|---:|
+| fcfs | 427033 +/- 2681 / 821128 +/- 10469 | 391864 +/- 4058 / 775140 +/- 10329 | 370.37 +/- 2.83 / 382.73 +/- 5.04 | 0.2187 +/- 0.0025 | 17.498 +/- 0.201 | 4.268 +/- 0.018% |
+| scalar_predicted | 346212 +/- 5083 / 668203 +/- 9864 | 317876 +/- 3844 / 630454 +/- 9626 | 298.09 +/- 2.16 / 308.88 +/- 3.11 | 0.2675 +/- 0.0040 | 21.402 +/- 0.317 | 0.584 +/- 0.017% |
+| oracle_profile | 349274 +/- 6479 / 671429 +/- 12157 | 320663 +/- 5449 / 633562 +/- 12045 | 297.32 +/- 2.34 / 315.98 +/- 9.12 | 0.2664 +/- 0.0045 | 21.308 +/- 0.362 | 0.584 +/- 0.017% |
+| predicted_profile | 346986 +/- 4583 / 669499 +/- 11206 | 318503 +/- 4092 / 632009 +/- 11062 | 298.06 +/- 2.06 / 309.49 +/- 4.42 | 0.2671 +/- 0.0043 | 21.368 +/- 0.344 | 0.584 +/- 0.017% |
+| uncertainty_fallback | 330053 +/- 7681 / 651623 +/- 17021 | 323485 +/- 7295 / 624688 +/- 15074 | 295.86 +/- 7.09 / 314.93 +/- 10.74 | 0.2732 +/- 0.0070 | 21.856 +/- 0.559 | 0.530 +/- 0.003% |
+| fixed_high | 71364 +/- 1292 / 136496 +/- 2156 | 66236 +/- 1094 / 129711 +/- 2123 | 53.45 +/- 0.92 / 55.40 +/- 1.49 | 1.3185 +/- 0.0175 | 105.478 +/- 1.403 | 0.000 +/- 0.000% |
 
-Task-level held-out quality is separate from route-level violations. The
-current real-GPU evaluator uses 16 windows from each dataset, context length
-512, and 8,176 scored target tokens. It reports teacher-forced perplexity
-against fixed-high:
+Routing, batching, padding, and overhead:
+
+| Rate | Policy | Effective bits | Batch occupancy | Profile padding bits / fraction | Predictor ms/repeat | Confidence fallback | Uncertainty fallback | DP guard |
+|---:|---|---:|---:|---:|---:|---:|---:|---:|
+| 100 | fcfs | 5.1396 +/- 0.0001 | 0.4366 +/- 0.0040 | 0.0000 / 0.000% | 0.000 +/- 0.000 | 35.861 +/- 0.015% | 0.000% | 1.230 +/- 0.001% |
+| 100 | scalar_predicted | 5.7212 +/- 0.0023 | 0.4366 +/- 0.0040 | 0.0167 / 0.325% | 0.841 +/- 0.022 | 36.127 +/- 0.008% | 0.000% | 1.228 +/- 0.001% |
+| 100 | oracle_profile | 5.7212 +/- 0.0023 | 0.4366 +/- 0.0040 | 0.0299 / 0.559% | 2.361 +/- 0.043 | 36.127 +/- 0.008% | 0.000% | 1.228 +/- 0.001% |
+| 100 | predicted_profile | 5.7212 +/- 0.0023 | 0.4366 +/- 0.0040 | 0.0157 / 0.294% | 2.183 +/- 0.041 | 36.127 +/- 0.008% | 0.000% | 1.228 +/- 0.001% |
+| 100 | uncertainty_fallback | 5.7461 +/- 0.0028 | 0.3382 +/- 0.0025 | 0.0109 / 0.204% | 2.316 +/- 0.033 | 31.778 +/- 0.037% | 14.063 +/- 0.000% | 1.083 +/- 0.001% |
+| 100 | fixed_high | 6.0000 +/- 0.0000 | 0.4366 +/- 0.0040 | 0.0000 / 0.000% | 0.000 +/- 0.000 | 0.000% | 0.000% | 0.000% |
+| 300 | fcfs | 5.1383 +/- 0.0000 | 0.8579 +/- 0.0091 | 0.0000 / 0.000% | 0.000 +/- 0.000 | 35.568 +/- 0.005% | 0.000% | 1.215 +/- 0.000% |
+| 300 | scalar_predicted | 5.7721 +/- 0.0006 | 0.8579 +/- 0.0091 | 0.0281 / 0.546% | 0.554 +/- 0.014 | 35.901 +/- 0.010% | 0.000% | 1.212 +/- 0.000% |
+| 300 | oracle_profile | 5.7721 +/- 0.0006 | 0.8579 +/- 0.0091 | 0.0464 / 0.867% | 1.836 +/- 0.087 | 35.901 +/- 0.010% | 0.000% | 1.212 +/- 0.000% |
+| 300 | predicted_profile | 5.7721 +/- 0.0006 | 0.8579 +/- 0.0091 | 0.0244 / 0.456% | 1.647 +/- 0.088 | 35.901 +/- 0.010% | 0.000% | 1.212 +/- 0.000% |
+| 300 | uncertainty_fallback | 5.7983 +/- 0.0003 | 0.6219 +/- 0.0097 | 0.0157 / 0.293% | 1.560 +/- 0.030 | 31.281 +/- 0.065% | 14.063 +/- 0.000% | 1.058 +/- 0.003% |
+| 300 | fixed_high | 6.0000 +/- 0.0000 | 0.8579 +/- 0.0091 | 0.0000 / 0.000% | 0.000 +/- 0.000 | 0.000% | 0.000% | 0.000% |
+
+“Confidence fallback” is the router-statistics fallback rate (fallback decisions
+per routed token). “Uncertainty fallback” is the request-level conservative
+held-out lane rate. The latter is 14.063% because 27 of 192 requests are
+intentionally uncertain.
+
+Task-level held-out quality is separate from route-level violations. The real
+GPU evaluator used 16 WikiText2 windows and 16 C4 windows, context length 512,
+and 8,176 scored target tokens per dataset. It reports teacher-forced
+perplexity against fixed-high:
 
 | Dataset / policy | Perplexity | Delta vs fixed-high | Effective bits | Fallback | Guard |
 |---|---:|---:|---:|---:|---:|
@@ -113,7 +117,7 @@ against fixed-high:
 
 ## Hotspots
 
-The successful CUDA-only torch.profiler traces were paired with the existing
+The successful CUDA-only torch.profiler traces were paired with synchronized
 CUDA-event phase timing in `QAQDPLLM_Linear`. On a representative native-32
 batch of seven requests, FCFS grouped execution accumulated 22.745 s of CUDA
 phase time over the profiled window: router 7.996 s (35.2%), estimator 1.193 s
@@ -121,10 +125,10 @@ phase time over the profiled window: router 7.996 s (35.2%), estimator 1.193 s
 remaining time is attention, cache, sampling, and framework work.
 
 The predicted-profile shared-maximum path accumulated 20.488 s: router
-10.926 s (53.3%) and estimator 1.672 s (8.2%); grouping and dequantized
-matmul are intentionally zero because that execution policy bypasses the
-per-bit grouped path. This makes the router the clearest adaptive-path hotspot
-and separates scheduler overhead from grouped dequantization overhead.
+10.926 s (53.3%) and estimator 1.672 s (8.2%); grouping and dequantized matmul
+are intentionally zero because that execution policy bypasses the per-bit
+grouped path. This makes the router the clearest adaptive-path hotspot and
+separates scheduler overhead from grouped dequantization overhead.
 
 The CUDA-only profiler trace has valid kernel/device events and a TensorBoard
 trace directory. Its CPU `record_function` phase rows are empty because CPU
@@ -133,39 +137,37 @@ from synchronized CUDA events, not inferred from wall-clock percentages.
 
 ## Time Breakdown
 
-All benchmark timing used one warmup batch followed by two measured repeats,
-with CUDA synchronization before and after each cached prefill/decode batch.
-Quality auditing was a separate CUDA replay and was excluded from latency and
-throughput. The profiler used one warmup and one active step on the same
-native-32 request format. Predictor overhead covers consuming held-out
-predictor outputs and applying scheduler decisions; it excludes model loading,
-tokenization, predictor training, JSON output, and quality auditing.
+The final matrix used one warmup batch and ten measured repeats, with CUDA
+synchronization before and after each cached prefill/decode batch. Quality
+auditing was a separate CUDA replay and was excluded from latency and
+throughput. Predictor overhead covers consuming held-out predictor outputs and
+applying scheduler decisions; it excludes model loading, tokenization,
+predictor training, JSON output, and quality auditing.
 
 ## Memory Breakdown
 
-The low/medium sampler traces observed roughly 10--12 GiB model residency on
-24 GiB RTX 3090 devices during valid waves. The successful profiler runs
-disabled `profile_memory` and wrote compact CUDA traces. Earlier CPU+CUDA
-profile-memory attempts caused multi-GiB profiler bookkeeping growth and were
-terminated; they are not used as benchmark results.
+The final workers used roughly 10--11 GiB of model residency on 24 GiB RTX 3090
+devices. The successful profiler runs disabled `profile_memory` and wrote
+compact CUDA traces. Earlier CPU+CUDA profile-memory attempts caused multi-GiB
+profiler bookkeeping growth and were terminated; they are not used as
+benchmark results.
 
 ## I/O Breakdown
 
-All inputs were local. Result JSON files and sampler CSVs were written under
-`/tmp`; profiler JSON and TensorBoard traces were also written under `/tmp`.
-No model, checkpoint, dataset, or large benchmark artifact was added to the
-repository.
+All inputs were local. The 36 result JSON files and sampler CSV were written
+under `/tmp`; profiler JSON and TensorBoard traces were also written under
+`/tmp`. No model, checkpoint, dataset, or large benchmark artifact was added to
+the repository.
 
 ## GPU Utilization
 
-Continuous `nvidia-smi` sampling was active during the seed-101 low/medium
-waves and the seed-202/303 low-rate waves. The sampled seed-101 rate-100
-policies showed roughly 32--37% mean utilization with p95 74--81%; the
-rate-300 adaptive wave averaged 33.1% with p95 90%, while fixed-high averaged
-63.2% with p95 100%. The seed-202/303 low-rate samplers provide additional
-trace coverage. These are device samples, not kernel-level attribution; the
-isolated seed-202/303 rate-300 reruns were timed with CUDA synchronization but
-did not have dedicated sampler CSVs.
+The continuous sampler recorded 99,000 rows (12,375 samples per GPU) from
+00:26:33 to 18:07:58 with zero sampler errors. In the final benchmark window
+starting 14:25:00, each GPU contributed 2,598 samples. GPU0 remained occupied by
+unrelated work and was deliberately excluded. GPUs1--7 reached 10,184--11,132
+MiB peak residency and mean sampled utilization of 14.15--33.54%, with 100%
+observed peaks. These are device samples, not kernel-level attribution; the
+mean includes synchronization and scheduling gaps.
 
 ## Bottleneck Hypotheses
 
@@ -177,18 +179,17 @@ did not have dedicated sampler CSVs.
    path: together they were 33.3% of the FCFS profiled CUDA phase time and were
    bypassed by the shared-maximum path. Confidence: high.
 
-3. Arrival rate changes occupancy and queueing more than it changes route
-   quality: across the three traces, occupancy rose from 0.437 to 0.858 for
-   the normal policies, while quality violations changed only modestly.
-   Confidence: medium.
+3. Arrival rate changes occupancy and queueing more than route quality: normal
+   policy occupancy rose from 0.437 at rate 100 to 0.858 at rate 300, while
+   audited violations remained in the same low-single-digit range. Confidence:
+   medium.
 
 4. Conservative uncertainty fallback trades occupancy for safety: it used
-   14.063% fallback at both rates, reduced route violations to 0.882%/0.531%,
-   and had occupancy 0.338/0.622. Confidence: medium.
+   14.063% request-level fallback at both rates, reduced route violations to
+   0.882% and 0.530%, and had occupancy 0.338 and 0.622. Confidence: medium.
 
-The next optimization should target router execution and the grouped
-dequantization path separately, using the CUDA-only trace plus synchronized
-phase counters as the regression gate; the current results support a
-research-prototype scheduler claim but are not publication-level evidence
-until the low/medium sweep is repeated with the requested ten measured
-repeats and a broader task suite.
+The next optimization should target router execution and grouped
+dequantization separately, using the CUDA-only trace plus synchronized phase
+counters as the regression gate. The ten-repeat low/medium matrix is suitable
+as research-prototype evidence; publication-level claims still need a broader
+task suite and independent GPU-isolation/repetition controls.
