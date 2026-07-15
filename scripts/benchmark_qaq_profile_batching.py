@@ -37,6 +37,12 @@ import numpy as np
 import torch
 from transformers import AutoTokenizer
 
+from any_precision.modules.QAQProfile import (
+    account_profile_execution,
+    aggregate_profile_accounting,
+    build_max_shared_profile,
+    route_profile_from_stats,
+)
 from any_precision import QAQDPLLMForCausalLM, load_qaq_router_checkpoint
 from scripts.evaluate_qaq_heldout import QAQPrecisionAuditor
 from scripts.qaq_request_demand_protocol import build_dataset_manifest
@@ -50,9 +56,10 @@ POLICIES = (
     "predicted_profile",
     "uncertainty_fallback",
     "fixed_high",
+    "max_profile_sharing",
 )
 PROFILE_MODE = "mlp_multibit_dp_guard"
-SCHEMA_VERSION = "qaq_profile_batching_benchmark_v1"
+SCHEMA_VERSION = "qaq_profile_batching_benchmark_v2_shared_profile"
 KERNEL_MAX_BATCH_SIZE = 8
 
 
@@ -68,6 +75,7 @@ class Request:
     predicted_scalar: float = 0.0
     predicted_profile: tuple[float, ...] = ()
     observed_profile: tuple[float, ...] = ()
+    layer_group_size: int = 0
     classification_confidence: float = 1.0
     uncertainty_cutoff: float = 0.0
     oracle_safe_bit: int | None = None
@@ -259,6 +267,13 @@ def make_requests(
                 raise ValueError(f"Missing frozen observed/predicted profile for {request_id}")
             observed = tuple(float(value) for value in record["observed_qaq_profiles"][PROFILE_MODE]["group_expected_bits"])
             predicted = tuple(float(value) for value in prediction["predicted_group_profile"])
+            profile_metadata = record["observed_qaq_profiles"][PROFILE_MODE]
+            layer_group_size = int(profile_metadata["layer_group_size"])
+            profile_dimension = len(profile_metadata["group_expected_bits"])
+            if layer_group_size < 1 or len(predicted) != profile_dimension:
+                raise ValueError(f"invalid frozen profile metadata for {request_id}")
+            if len(predicted) != len(observed):
+                raise ValueError(f"profile length mismatch for {request_id}")
             if len(observed) != len(predicted) or not observed:
                 raise ValueError(f"Profile length mismatch for {request_id}")
             prompt_length = int(item["prompt_length_tokens"])
@@ -272,6 +287,7 @@ def make_requests(
                 prompt_length=prompt_length,
                 continuation_length=continuation_length,
                 prompt_ids=tensors[request_id][:prompt_length].clone(),
+                layer_group_size=layer_group_size,
                 predicted_scalar=float(prediction["predicted_effective_bits"]),
                 predicted_profile=predicted,
                 observed_profile=observed,
@@ -281,6 +297,11 @@ def make_requests(
             ))
     if len({request.request_id for request in requests}) != len(requests):
         raise ValueError("Request IDs must be unique across datasets")
+    metadata = {(request.layer_group_size, len(request.predicted_profile)) for request in requests}
+    if len(metadata) != 1:
+        raise ValueError(
+            f"all scheduled requests must share frozen profile metadata, got {sorted(metadata)}"
+        )
     return requests
 
 
@@ -324,7 +345,7 @@ def scalar_bucket(value: float, bucket_size: float) -> int:
 def is_compatible(first: Request, candidate: Request, policy: str, scalar_bucket_size: float, profile_threshold: float) -> bool:
     if first.continuation_length != candidate.continuation_length:
         return False
-    if policy in {"fcfs", "fixed_high"}:
+    if policy in {"fcfs", "fixed_high", "max_profile_sharing"}:
         return True
     if policy == "scalar_predicted":
         return scalar_bucket(first.predicted_scalar, scalar_bucket_size) == scalar_bucket(candidate.predicted_scalar, scalar_bucket_size)
@@ -394,14 +415,22 @@ def build_batch_plan(requests: list[Request], args: argparse.Namespace, policy: 
 
 
 def set_execution_policy(model, policy: str, batch_size: int | None = None) -> str:
-    batch_policy = "group" if policy in {"fcfs", "fixed_high"} or batch_size == 1 else "max"
+    if policy == "max_profile_sharing":
+        execution_batch_policy = "shared_profile"
+        batch_policy = "group"
+    else:
+        execution_batch_policy = None
+        batch_policy = "group" if policy in {"fcfs", "fixed_high"} or batch_size == 1 else "max"
     for linear in model.ap_linears:
         linear.batch_policy = batch_policy
+
     model.batch_policy = batch_policy
-    return batch_policy
 
 
+    return execution_batch_policy or batch_policy
 def policy_mode(policy: str, batch: list[Request]) -> str:
+    if policy == "max_profile_sharing":
+        return "shared_profile"
     if policy == "fixed_high":
         return "fixed_high"
     if policy == "uncertainty_fallback" and batch[0].uncertain:
@@ -410,7 +439,7 @@ def policy_mode(policy: str, batch: list[Request]) -> str:
 
 
 def profile_padding(batch: list[Request], policy: str) -> dict[str, float]:
-    if policy in {"fcfs", "fixed_high"}:
+    if policy in {"fcfs", "fixed_high", "max_profile_sharing"}:
         return {"mean_bits": 0.0, "fraction": 0.0, "max_span_bits": 0.0}
     if policy == "scalar_predicted":
         values = np.asarray([[request.predicted_scalar] for request in batch], dtype=np.float64)
@@ -430,6 +459,18 @@ def profile_padding(batch: list[Request], policy: str) -> dict[str, float]:
         "fraction": float(padding.sum() / denominator),
         "max_span_bits": float((values.max(axis=0) - values.min(axis=0)).mean()),
     }
+
+
+def build_shared_batch_profile(model, batch: list[Request]) -> dict[str, Any]:
+    group_sizes = {int(request.layer_group_size) for request in batch}
+    if len(group_sizes) != 1 or not next(iter(group_sizes)):
+        raise ValueError("shared-profile batch requests must have one positive layer_group_size")
+    return build_max_shared_profile(
+        [(request.request_id, request.predicted_profile) for request in batch],
+        next(iter(group_sizes)),
+        model.route_map,
+        model.shared_route_valid_bits(),
+    )
 
 
 def request_stream_hash(requests: list[Request]) -> str:
@@ -456,6 +497,7 @@ def aggregate_router_stats(batch_results: list[dict[str, Any]]) -> dict[str, Any
     total_tokens = 0
     selected_bits = 0
     weighted_effective = 0.0
+    shared_profile_tokens = 0
     fallback = 0
     guard = 0
     histogram: dict[str, dict[str, int]] = {}
@@ -467,6 +509,7 @@ def aggregate_router_stats(batch_results: list[dict[str, Any]]) -> dict[str, Any
         weighted_effective += float(stats.get("effective_bits", 0.0)) * tokens
         fallback += int(stats.get("total_fallbacks", 0))
         guard += int(stats.get("total_dp_guard_triggers", 0))
+        shared_profile_tokens += int(stats.get("total_shared_profile_tokens", 0))
         merge_bit_histogram(histogram, stats)
     return {
         "total_tokens": total_tokens,
@@ -477,6 +520,9 @@ def aggregate_router_stats(batch_results: list[dict[str, Any]]) -> dict[str, Any
         "total_dp_guard_triggers": guard,
         "dp_guard_rate": guard / total_tokens if total_tokens else 0.0,
         "per_layer_bit_histogram": {route: dict(sorted(counts.items())) for route, counts in sorted(histogram.items())},
+        "shared_profile_execution": bool(shared_profile_tokens),
+        "total_shared_profile_tokens": shared_profile_tokens,
+        "shared_profile_row_fraction": shared_profile_tokens / total_tokens if total_tokens else 0.0,
     }
 
 
@@ -515,7 +561,15 @@ def run_policy(model, requests: list[Request], tokenizer, args: argparse.Namespa
     batch_policy = set_execution_policy(model, policy, args.max_batch_size)
     for warmup_index, batch in enumerate(templates[: args.warmup_batches]):
         set_execution_policy(model, policy, len(batch))
-        execute_batch(model, batch, policy_mode(policy, batch), tokenizer.pad_token_id, torch.device(args.device))
+        shared_profile = build_shared_batch_profile(model, batch) if policy == "max_profile_sharing" else None
+        execute_batch(
+            model,
+            batch,
+            policy_mode(policy, batch),
+            tokenizer.pad_token_id,
+            torch.device(args.device),
+            shared_profile=shared_profile["shared_route_profile"] if shared_profile else None,
+        )
         print(f"warmup policy={policy} batch={warmup_index + 1}/{min(args.warmup_batches, len(templates))}", flush=True)
 
     repeats: list[dict[str, Any]] = []
@@ -536,14 +590,29 @@ def run_policy(model, requests: list[Request], tokenizer, args: argparse.Namespa
             )
             mode = policy_mode(policy, batch)
             batch_policy_for_execution = set_execution_policy(model, policy, len(batch))
+            shared_profile = build_shared_batch_profile(model, batch) if policy == "max_profile_sharing" else None
             gpu_start_ms = schedule_start_ms + scheduler_overhead_ms
-            execution = execute_batch(model, batch, mode, tokenizer.pad_token_id, torch.device(args.device))
+            execution = execute_batch(
+                model,
+                batch,
+                mode,
+                tokenizer.pad_token_id,
+                torch.device(args.device),
+                shared_profile=shared_profile["shared_route_profile"] if shared_profile else None,
+            )
+            if shared_profile is not None:
+                executed = route_profile_from_stats(execution["router_stats"])
+                shared_profile["executed_route_profile"] = executed
+                shared_profile["profile_accounting"] = account_profile_execution(
+                    shared_profile, executed, model.route_map, model.shared_route_valid_bits()
+                )
             finish_ms = gpu_start_ms + float(execution["service_ms"])
             padding = profile_padding(batch, policy)
             batch_id = f"{policy}-repeat{repeat_index}-batch{len(batch_results):04d}"
             batch_result = {
                 "batch_id": batch_id,
                 "request_ids": [request.request_id for request in batch],
+                "shared_profile": shared_profile,
                 "batch_size": len(batch),
                 "policy": policy,
                 "mode": mode,
@@ -592,6 +661,10 @@ def run_policy(model, requests: list[Request], tokenizer, args: argparse.Namespa
         "policy": policy,
         "execution_batch_policy": batch_policy,
         "batch_plan": [[request.request_id for request in batch] for batch in templates],
+        "shared_profile_batch_count": sum(bool(item.get("shared_profile")) for item in all_batches),
+        "profile_accounting": aggregate_profile_accounting(
+            [item["shared_profile"]["profile_accounting"] for item in all_batches if item.get("shared_profile")]
+        ) if any(item.get("shared_profile") for item in all_batches) else None,
         "warmup_batches": min(args.warmup_batches, len(templates)),
         "repeats": repeats,
         "summary": {
@@ -638,9 +711,13 @@ def quality_audit(model, policy: str, batch_plan: list[list[Request]], tokenizer
     for batch_index, batch in enumerate(batch_plan):
         mode = policy_mode(policy, batch)
         set_execution_policy(model, policy, len(batch))
+        shared_profile = build_shared_batch_profile(model, batch) if policy == "max_profile_sharing" else None
         auditor.start_mode(policy)
         auditor.start_example(batch_index)
-        execute_batch(model, batch, mode, tokenizer.pad_token_id, torch.device(args.device))
+        execute_batch(
+            model, batch, mode, tokenizer.pad_token_id, torch.device(args.device),
+            shared_profile=shared_profile["shared_route_profile"] if shared_profile else None,
+        )
         merge_quality_counts(aggregate, auditor.report()["summary"])
         print(f"quality-audit policy={policy} batch={batch_index + 1}/{len(batch_plan)}", flush=True)
     model.set_decision_observer(None)
@@ -757,10 +834,20 @@ def main() -> None:
             "quality_audit": not args.skip_quality_audit,
             "quality_error_threshold": error_threshold,
         },
+        "shared_profile_contract": {
+            "policy": "max_profile_sharing",
+            "profile_source": "predicted_group_profile",
+            "composition": "component-wise maximum over the actual scheduled batch",
+            "projection_rule": "route-valid conservative ceiling",
+            "singleton_behavior": "singleton predicted profile is still applied",
+            "quantile_sharing": "pending",
+        },
         "policies": {},
         "limitations": [
             "Arrival times are a deterministic replay trace generated from the selected frozen test requests; all policies consume the identical trace.",
-            "Profile padding is the scheduler shared-profile demand padding; actual shared execution uses the existing per-route maximum-bit hook.",
+            "max_profile_sharing applies one projected route-level profile throughout prefill and decode; its continuous group profile and executed route profile are recorded per batch.",
+            "Scheduler-profile under/exact/over accounting compares executed route bits with each request's projected predicted target; it is separate from QAQPrecisionAuditor route safety.",
+            "Quantile profile sharing is pending and is not included in this schema.",
             "Quality violations are measured by the real output-error auditor in a separate replay and are not included in timed latency or throughput.",
             "Predictor overhead is the measured CPU cost of consuming held-out predictor outputs and applying bucketing/fallback decisions; predictor model fitting is not timed.",
         ],

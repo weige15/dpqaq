@@ -1,4 +1,5 @@
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -29,6 +30,7 @@ def request(request_id, prompt=128, continuation=32, profile=(4.0, 4.0), confide
         prompt_length=prompt,
         continuation_length=continuation,
         prompt_ids=torch.arange(prompt),
+        layer_group_size=4,
         arrival_ms=arrival,
         predicted_profile=profile,
         classification_confidence=confidence,
@@ -167,6 +169,7 @@ def test_manual_cached_decode_uses_left_padding_aware_position_ids():
     short = request("short", prompt=2, continuation=3)
     short.prompt_ids = torch.tensor([10, 11])
     long = request("long", prompt=4, continuation=3)
+
     long.prompt_ids = torch.tensor([20, 21, 22, 23])
 
     result = execute_batch(model, [short, long], "mlp_multibit_dp_guard", 0, torch.device("cpu"))
@@ -176,3 +179,75 @@ def test_manual_cached_decode_uses_left_padding_aware_position_ids():
     assert model.calls[2]["position_ids"].tolist() == [[3], [5]]
     assert result["generated_token_slots"] == 6
     assert set(result["generated_token_sha256"]) == {"short", "long"}
+
+
+class SharedProfileFakeCachedModel(FakeCachedModel):
+    route_map = [
+        {"route_id": 0, "layer": 0, "parent": "self_attn", "name": "q_proj", "route_name": "0.q_proj"},
+        {"route_id": 1, "layer": 4, "parent": "self_attn", "name": "q_proj", "route_name": "4.q_proj"},
+    ]
+
+    def __init__(self):
+        super().__init__()
+        self.router_mode = "mlp_multibit_dp_guard"
+        self.active_profile = None
+        self.profiles_seen = []
+        self.raise_in_forward = False
+
+    def shared_route_valid_bits(self):
+        return {"0.q_proj": [3, 4, 5, 6], "4.q_proj": [3, 5]}
+
+    @contextmanager
+    def shared_profile(self, profile):
+        previous = self.active_profile
+        self.active_profile = dict(profile)
+        try:
+            yield dict(profile)
+        finally:
+            self.active_profile = previous
+
+    def __call__(self, **kwargs):
+        self.profiles_seen.append(None if self.active_profile is None else dict(self.active_profile))
+        if self.raise_in_forward:
+            raise RuntimeError("forward failed")
+        return super().__call__(**kwargs)
+
+
+def test_shared_profile_is_active_for_prefill_and_every_decode_then_cleared():
+    model = SharedProfileFakeCachedModel()
+    result = execute_batch(
+        model,
+        [request("a", continuation=3)],
+        "shared_profile",
+        0,
+        torch.device("cpu"),
+        shared_profile={"0.q_proj": 5, "4.q_proj": 5},
+    )
+
+    assert model.profiles_seen == [
+        {"0.q_proj": 5, "4.q_proj": 5},
+        {"0.q_proj": 5, "4.q_proj": 5},
+        {"0.q_proj": 5, "4.q_proj": 5},
+    ]
+    assert model.active_profile is None
+    assert "input_ids" not in result and "prompt_ids" not in result
+
+
+def test_shared_profile_is_cleared_after_exception_and_baselines_receive_none():
+    model = SharedProfileFakeCachedModel()
+    model.raise_in_forward = True
+    with pytest.raises(RuntimeError, match="forward failed"):
+        execute_batch(
+            model,
+            [request("a", continuation=2)],
+            "shared_profile",
+            0,
+            torch.device("cpu"),
+            shared_profile={"0.q_proj": 5, "4.q_proj": 5},
+        )
+    assert model.active_profile is None
+
+    model.raise_in_forward = False
+    execute_batch(model, [request("b", continuation=2)], "mlp_multibit_dp_guard", 0, torch.device("cpu"))
+    execute_batch(model, [request("c", continuation=2)], "fixed_high", 0, torch.device("cpu"))
+    assert model.profiles_seen[-2:] == [None, None]

@@ -60,6 +60,7 @@ class QAQDPLLM_Linear(nn.Module):
         self.fallback_bits = int(fallback_bits)
         self.prefill_by_router = bool(prefill_by_router)
         self.batch_policy = batch_policy
+        self.shared_precision = None
         self.est_linear = est_linear
         self.b_l = int(b_l) if b_l is not None else None
         self.b_h = int(b_h) if b_h is not None else None
@@ -100,6 +101,7 @@ class QAQDPLLM_Linear(nn.Module):
         self.dp_threshold_token_count = 0
         self.dp_threshold_high_count = 0
         self.routed_token_count = 0
+        self.shared_profile_token_count = 0
         self.phase_timing_enabled = False
         self.decision_observer = None
         self.clear_phase_timing()
@@ -129,6 +131,8 @@ class QAQDPLLM_Linear(nn.Module):
         return y
 
     def _forward_without_bias(self, x):
+        if self.router_mode == "shared_profile":
+            return self._shared_profile_forward(x)
         if self._is_prefill(x) and not self.prefill_by_router:
             return self._fixed_precision_forward(x, self._max_valid_bit())
         return self._router_forward(x)
@@ -162,6 +166,9 @@ class QAQDPLLM_Linear(nn.Module):
 
 
     def _fixed_precision_forward(self, x, bit):
+        bit = int(bit)
+        if bit not in self._valid_bits():
+            raise RuntimeError(f"Precision {bit} is not valid for {self.route_name}: {self._valid_bits()}")
         flat_x = x.reshape(-1, x.shape[-1])
         self._notify_decision(
             flat_x,
@@ -175,6 +182,16 @@ class QAQDPLLM_Linear(nn.Module):
 
         y = matmul_kbit(x, self.qweight, self._buffers[f'lut{bit}'], bit)
         self.comp_count[bit] += x.numel() // x.shape[-1]
+        return y
+
+    def _shared_profile_forward(self, x):
+        if self.shared_precision is None:
+            raise RuntimeError(
+                f"shared_profile mode requires a supplied shared precision for {self.route_name}"
+            )
+        rows = x.numel() // x.shape[-1]
+        y = self._fixed_precision_forward(x, self.shared_precision)
+        self.shared_profile_token_count += rows
         return y
 
     def _router_forward(self, x):
@@ -353,6 +370,19 @@ class QAQDPLLM_Linear(nn.Module):
     def set_precision(self, precision):
         self.precision = precision
 
+    def set_shared_precision(self, precision):
+        if isinstance(precision, bool) or int(precision) != precision:
+            raise ValueError(f"Shared precision for {self.route_name} must be an integer")
+        precision = int(precision)
+        if precision not in self._valid_bits():
+            raise ValueError(
+                f"Shared precision {precision} is not valid for {self.route_name}: {self._valid_bits()}"
+            )
+        self.shared_precision = precision
+
+    def clear_shared_precision(self):
+        self.shared_precision = None
+
     def set_router_mode(self, router_mode):
         self.router_mode = router_mode
 
@@ -364,6 +394,7 @@ class QAQDPLLM_Linear(nn.Module):
         self.dp_threshold_token_count = 0
         self.dp_threshold_high_count = 0
         self.routed_token_count = 0
+        self.shared_profile_token_count = 0
         self.clear_phase_timing()
 
     def set_phase_timing_enabled(self, enabled=True):

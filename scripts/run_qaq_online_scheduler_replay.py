@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import hashlib
 import json
 import math
@@ -32,6 +33,12 @@ import transformers
 from transformers import AutoTokenizer
 
 from any_precision import QAQDPLLMForCausalLM
+from any_precision.modules.QAQProfile import (
+    account_profile_execution,
+    aggregate_profile_accounting,
+    build_max_shared_profile,
+    route_profile_from_stats,
+)
 from scripts.analyze_qaq_request_demand_preregistered import verify_freeze
 from scripts.qaq_request_demand_protocol import (
     atomic_write_json,
@@ -43,10 +50,10 @@ from scripts.qaq_request_demand_protocol import (
     token_ids_sha256,
 )
 
-RUN_SCHEMA = "qaq_online_scheduler_replay_run_v1"
-SCENARIO_SCHEMA = "qaq_online_scheduler_replay_scenario_v1"
-SUMMARY_SCHEMA = "qaq_online_scheduler_replay_summary_v1"
-POLICIES = ("ordinary_fcfs", "length_fcfs", "predicted_block_fallback_lane")
+RUN_SCHEMA = "qaq_online_scheduler_replay_run_v2_shared_profile"
+SCENARIO_SCHEMA = "qaq_online_scheduler_replay_scenario_v2_shared_profile"
+SUMMARY_SCHEMA = "qaq_online_scheduler_replay_summary_v2_shared_profile"
+POLICIES = ("ordinary_fcfs", "length_fcfs", "predicted_block_fallback_lane", "max_profile_sharing")
 LOAD_FRACTIONS = (0.50, 0.80, 0.95)
 SCHEDULING_SEEDS = (101, 202, 303)
 PREDICTOR_SEEDS = (17, 29, 43)
@@ -65,6 +72,7 @@ class ReplayRequest:
     prompt_length: int
     continuation_length: int
     prompt_ids: torch.Tensor
+    layer_group_size: int = 0
     arrival_ms: float = 0.0
     predicted_profile: tuple[float, ...] = ()
     classification_confidence: float = 1.0
@@ -115,6 +123,7 @@ def source_hashes() -> dict[str, str]:
     paths = (
         "scripts/run_qaq_online_scheduler_replay.py",
         "scripts/analyze_qaq_request_demand_preregistered.py",
+        "any_precision/modules/QAQProfile.py",
         "scripts/collect_qaq_route_safety_supplement.py",
         "scripts/qaq_request_demand_protocol.py",
         "doc/qaq-request-demand-preregistered-protocol.md",
@@ -167,7 +176,7 @@ def compatible(first: ReplayRequest, candidate: ReplayRequest, policy: str) -> b
         return True
     if first.cell != candidate.cell:
         return False
-    if policy == "length_fcfs":
+    if policy in {"length_fcfs", "max_profile_sharing"}:
         return True
     if policy == "predicted_block_fallback_lane":
         if first.uncertain != candidate.uncertain:
@@ -237,8 +246,36 @@ def left_pad_batch(requests: list[ReplayRequest], pad_token_id: int, device: tor
     return input_ids.to(device), attention.to(device)
 
 
+@contextmanager
+def _model_execution_context(model, mode: str, shared_profile: dict[str, int] | None):
+    if shared_profile is None:
+        if mode == "shared_profile":
+            raise RuntimeError("shared_profile mode requires a complete supplied route profile")
+        yield
+        return
+    if mode != "shared_profile":
+        raise RuntimeError("a shared profile is only valid with explicit shared_profile mode")
+    if not hasattr(model, "shared_profile"):
+        raise TypeError("model does not expose the shared_profile context manager")
+    with model.shared_profile(shared_profile):
+        yield
+
+
 @torch.no_grad()
 def execute_batch(
+    model,
+    requests: list[ReplayRequest],
+    mode: str,
+    pad_token_id: int,
+    device: torch.device,
+    shared_profile: dict[str, int] | None = None,
+) -> dict[str, Any]:
+    with _model_execution_context(model, mode, shared_profile):
+        return _execute_batch_impl(model, requests, mode, pad_token_id, device)
+
+
+@torch.no_grad()
+def _execute_batch_impl(
     model,
     requests: list[ReplayRequest],
     mode: str,
@@ -330,11 +367,14 @@ def summarize_scenario(request_results: list[dict[str, Any]], batch_results: lis
     average_bits = []
     fallbacks = 0
     guard_triggers = 0
+    profile_accounts = []
     profiles = []
     for batch in batch_results:
         lane_occupancy[batch["lane_id"]] += batch["batch_size"]
         stats = batch["router_stats"]
         effective_bits.append(float(stats["effective_bits"]))
+        if batch.get("profile_accounting"):
+            profile_accounts.append(batch["profile_accounting"])
         average_bits.append(float(stats["average_selected_bit"]))
         fallbacks += int(stats["total_fallbacks"])
         guard_triggers += int(stats["total_dp_guard_triggers"])
@@ -368,6 +408,8 @@ def summarize_scenario(request_results: list[dict[str, Any]], batch_results: lis
         "queue_delay_ms": {"p50": percentile(queue, 0.50), "p95": percentile(queue, 0.95), "p99": percentile(queue, 0.99)},
         "end_to_end_latency_ms": {"p50": percentile(end_to_end, 0.50), "p95": percentile(end_to_end, 0.95), "p99": percentile(end_to_end, 0.99)},
         "ttft_ms": {"p50": percentile(ttft, 0.50), "p95": percentile(ttft, 0.95), "p99": percentile(ttft, 0.99)},
+        "shared_profile_batch_count": len(profile_accounts),
+        "profile_accounting": aggregate_profile_accounting(profile_accounts) if profile_accounts else None,
         "tpot_ms": {"p50": percentile(tpot, 0.50), "p95": percentile(tpot, 0.95), "p99": percentile(tpot, 0.99)},
         "deadline_miss_fraction": statistics.fmean(item["deadline_missed"] for item in request_results),
         "scheduler_cpu_overhead_ms": sum(batch["scheduler_cpu_overhead_ms"] for batch in batch_results),
@@ -377,6 +419,17 @@ def summarize_scenario(request_results: list[dict[str, Any]], batch_results: lis
         "oom_count": 0,
     }
 
+
+def build_shared_batch_profile(model, batch: list[ReplayRequest]) -> dict[str, Any]:
+    group_sizes = {int(request.layer_group_size) for request in batch}
+    if len(group_sizes) != 1 or not next(iter(group_sizes)):
+        raise ValueError("shared-profile batch requests must have one positive layer_group_size")
+    return build_max_shared_profile(
+        [(request.request_id, request.predicted_profile) for request in batch],
+        next(iter(group_sizes)),
+        model.route_map,
+        model.shared_route_valid_bits(),
+    )
 
 def run_online_scenario(
     model,
@@ -393,7 +446,8 @@ def run_online_scenario(
     request_results = []
     while unscheduled:
         batch, schedule_start_ms, overhead_ms = choose_online_batch(unscheduled, current_time_ms, policy)
-        mode = "fixed_high" if policy == "predicted_block_fallback_lane" and batch[0].uncertain else "mlp_multibit_dp_guard"
+        shared_profile = build_shared_batch_profile(model, batch) if policy == "max_profile_sharing" else None
+        mode = "shared_profile" if shared_profile is not None else "fixed_high" if policy == "predicted_block_fallback_lane" and batch[0].uncertain else "mlp_multibit_dp_guard"
         if policy == "predicted_block_fallback_lane":
             if batch[0].uncertain:
                 lane_id = "fallback_fixed6"
@@ -403,7 +457,20 @@ def run_online_scenario(
         else:
             lane_id = policy
         gpu_start_ms = schedule_start_ms + overhead_ms
-        execution = execute_batch(model, batch, mode, pad_token_id, device)
+        execution = execute_batch(
+            model,
+            batch,
+            mode,
+            pad_token_id,
+            device,
+            shared_profile=shared_profile["shared_route_profile"] if shared_profile else None,
+        )
+        if shared_profile is not None:
+            executed = route_profile_from_stats(execution["router_stats"])
+            shared_profile["executed_route_profile"] = executed
+            shared_profile["profile_accounting"] = account_profile_execution(
+                shared_profile, executed, model.route_map, model.shared_route_valid_bits()
+            )
         finish_ms = gpu_start_ms + execution["service_ms"]
         batch_id = f"{scenario_id}-batch-{len(batch_results):05d}"
         batch_results.append({
@@ -413,6 +480,7 @@ def run_online_scenario(
             "gpu_start_ms": gpu_start_ms,
             "finish_ms": finish_ms,
             "scheduler_cpu_overhead_ms": overhead_ms,
+            "shared_profile": shared_profile,
             "lane_id": lane_id,
             **execution,
         })
@@ -435,7 +503,7 @@ def run_online_scenario(
                 "deadline_missed": bool(end_to_end > deadline),
                 "generated_tokens": request.continuation_length,
                 "generated_token_sha256": execution["generated_token_sha256"][request.request_id],
-                "uncertain_fallback_lane": request.uncertain,
+                "uncertain_fallback_lane": bool(policy == "predicted_block_fallback_lane" and request.uncertain),
             })
         batch_ids = {request.request_id for request in batch}
         unscheduled = [request for request in unscheduled if request.request_id not in batch_ids]
@@ -451,6 +519,30 @@ def run_online_scenario(
         "requests": sorted(request_results, key=lambda item: item["request_id"]),
         "contains_raw_text": False,
     }
+
+
+def load_profile_metadata(collection_dir: Path, dataset: str) -> dict[str, dict[str, int]]:
+    metadata = {}
+    shard_dir = collection_dir / "datasets" / dataset / "shards"
+    for path in sorted(shard_dir.glob("*.jsonl")):
+        with path.open() as source:
+            for line in source:
+                record = json.loads(line)
+                request_id = str(record["request_id"])
+                profile = record["observed_qaq_profiles"]["mlp_multibit_dp_guard"]
+                value = {
+                    "layer_group_size": int(profile["layer_group_size"]),
+                    "profile_dimension": len(profile["group_expected_bits"]),
+                }
+                if request_id in metadata and metadata[request_id] != value:
+                    raise ValueError(f"inconsistent profile metadata for {request_id}")
+    if not metadata:
+        raise ValueError(f"no frozen profile metadata found for {dataset}")
+    dimensions = {value["profile_dimension"] for value in metadata.values()}
+    group_sizes = {value["layer_group_size"] for value in metadata.values()}
+    if len(dimensions) != 1 or len(group_sizes) != 1:
+        raise ValueError(f"inconsistent frozen profile metadata for {dataset}")
+    return metadata
 
 
 def predictor_map(
@@ -471,12 +563,19 @@ def make_requests(
     partition: str,
     predictions: dict[str, dict[str, Any]] | None = None,
     cutoff: float = 0.0,
+    profile_metadata: dict[str, dict[str, int]] | None = None,
 ) -> list[ReplayRequest]:
     result = []
     for item in manifest["requests"]:
         if item["partition"] != partition:
             continue
         prediction = predictions.get(item["request_id"]) if predictions else None
+        metadata = profile_metadata.get(item["request_id"]) if profile_metadata else None
+        if prediction is not None and metadata is not None:
+            if len(prediction["predicted_group_profile"]) != metadata["profile_dimension"]:
+                raise ValueError(f"predicted profile dimension mismatch for {item['request_id']}")
+        if metadata is None:
+            metadata = {"layer_group_size": 0, "profile_dimension": len(prediction["predicted_group_profile"]) if prediction else 0}
         result.append(ReplayRequest(
             request_id=item["request_id"],
             dataset=item["dataset"],
@@ -487,6 +586,7 @@ def make_requests(
             predicted_profile=tuple(prediction["predicted_group_profile"]) if prediction else (),
             classification_confidence=float(prediction["classification_confidence"]) if prediction else 1.0,
             uncertainty_cutoff=cutoff,
+            layer_group_size=metadata["layer_group_size"],
         ))
     return result
 
@@ -526,6 +626,7 @@ def calibrate_dataset(model, requests: list[ReplayRequest], pad_token_id: int, d
 def run_registered_warmups(
     model,
     manifests: dict[str, dict[str, Any]],
+    profile_metadata: dict[str, dict[str, dict[str, int]]],
     tensors: dict[str, dict[str, torch.Tensor]],
     analysis: dict[str, Any],
     output_dir: Path,
@@ -536,7 +637,7 @@ def run_registered_warmups(
 ) -> None:
     for dataset, manifest in manifests.items():
         predictions, cutoff = predictor_map(analysis, dataset, 101)
-        requests = make_requests(manifest, tensors[dataset], "test", predictions, cutoff)
+        requests = make_requests(manifest, tensors[dataset], "test", predictions, cutoff, profile_metadata[dataset])
         for policy in POLICIES:
             for cell in sorted({request.cell for request in requests}):
                 values = sorted(
@@ -559,9 +660,13 @@ def run_registered_warmups(
                         continue
                     first = lane_values[0]
                     batch = [request for request in lane_values if compatible(first, request, policy)][:MAX_BATCH_SIZE]
-                    mode = "fixed_high" if policy == "predicted_block_fallback_lane" and first.uncertain else "mlp_multibit_dp_guard"
+                    shared_profile = build_shared_batch_profile(model, batch) if policy == "max_profile_sharing" else None
+                    mode = "shared_profile" if shared_profile is not None else "fixed_high" if policy == "predicted_block_fallback_lane" and first.uncertain else "mlp_multibit_dp_guard"
                     for _ in range(warmup_batches):
-                        execute_batch(model, batch, mode, pad_token_id, device)
+                        execute_batch(
+                            model, batch, mode, pad_token_id, device,
+                            shared_profile=shared_profile["shared_route_profile"] if shared_profile else None,
+                        )
                     atomic_write_json(marker, {
                         "validation_status": "REAL_GPU_WARMUP_COMPLETE",
                         "replay_id": replay_id,
@@ -592,6 +697,12 @@ def build_run_manifest(args, freeze, frozen_run, analysis, route_summary, device
         "route_safety_supplement_id": route_summary["supplement_id"],
         "input_hashes": {name: value.get("tree_sha256", value.get("files", [{}])[0].get("sha256")) for name, value in inputs.items()},
         "source_files_sha256": source_hashes(),
+        "shared_profile": {
+            "policy": "max_profile_sharing",
+            "source": "predicted_group_profile",
+            "projection_rule": "route-valid conservative ceiling",
+            "quantile_policy": "pending",
+        },
         "policies": list(POLICIES),
         "load_fractions": list(LOAD_FRACTIONS),
         "scheduling_seeds": list(SCHEDULING_SEEDS),
@@ -721,6 +832,7 @@ def main() -> None:
         tensors[dataset] = values
 
     candidate = build_run_manifest(args, freeze, frozen_run, analysis, route_summary, device)
+    profile_metadata = {dataset: load_profile_metadata(collection_dir, dataset) for dataset in manifests}
     run_manifest = ensure_run_manifest(output_dir / "run-manifest.json", candidate)
     expected_count = len(manifests) * len(LOAD_FRACTIONS) * len(SCHEDULING_SEEDS) * args.repeat * len(POLICIES)
     if args.validate_only:
@@ -755,7 +867,7 @@ def main() -> None:
         if path.exists():
             calibrations[dataset] = json.loads(path.read_text())
         else:
-            requests = make_requests(manifest, tensors[dataset], "calibration")
+            requests = make_requests(manifest, tensors[dataset], "calibration", profile_metadata=profile_metadata[dataset])
             if args.diagnostic_request_limit is not None:
                 requests = requests[:args.diagnostic_request_limit]
             result = calibrate_dataset(model, requests, tokenizer.pad_token_id, device, args.warmup_batches, args.repeat)
@@ -765,7 +877,7 @@ def main() -> None:
 
     if not args.diagnostic_skip_warmups:
         run_registered_warmups(
-            model, manifests, tensors, analysis, output_dir, run_manifest["replay_id"],
+            model, manifests, profile_metadata, tensors, analysis, output_dir, run_manifest["replay_id"],
             tokenizer.pad_token_id, device, args.warmup_batches,
         )
 
@@ -780,7 +892,7 @@ def main() -> None:
             arrival_rate = load * calibration["saturated_request_rate"]
             for seed_index, seed in enumerate(SCHEDULING_SEEDS):
                 predictions, cutoff = predictor_map(analysis, dataset, seed)
-                base = make_requests(manifests[dataset], tensors[dataset], "test", predictions, cutoff)
+                base = make_requests(manifests[dataset], tensors[dataset], "test", predictions, cutoff, profile_metadata[dataset])
                 if args.diagnostic_request_limit is not None:
                     base = base[:args.diagnostic_request_limit]
                 arrivals = deterministic_arrivals(base, dataset, seed, arrival_rate)

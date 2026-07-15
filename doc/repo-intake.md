@@ -50,6 +50,7 @@ Python package for Any-Precision / DP-LLM quantized causal language model infere
 
 ## Existing Modules
 
+- `any_precision/modules/QAQProfile.py`: CPU-testable profile validation, max composition, route projection, and scheduler-profile accounting utilities.
 - `any_precision/modules/AnyPrecisionLinear.py`: quantized linear layer using `dequant_kbit` and `matmul_kbit`.
 - `any_precision/modules/AnyPrecisionForCausalLM.py`: loads an Any-Precision quantized model and replaces linears.
 - `any_precision/modules/DPLLM_Linear.py`: DP-LLM runtime precision selector using linear-regression or JL relative-error estimates and thresholds.
@@ -81,7 +82,9 @@ Python package for Any-Precision / DP-LLM quantized causal language model infere
 
 ## Known Broken Parts
 
-- `README.md` states the repository currently contains performance evaluation code and that latency measurement code will be updated later.
+- `max_profile_sharing` is an explicit v2 scheduler policy: it applies a complete predicted route profile through prefill and decode. Historical v1 router-max artifacts are not reinterpreted.
+- `scripts/benchmark_qaq_profile_batching.py` and `scripts/run_qaq_online_scheduler_replay.py` record shared-profile source, continuous/projected profiles, executed route bits, and separate scheduler-profile accounting.
+- No real CUDA v2 validation has been run in this checkout; the local environment also lacks the project CUDA/PyTorch test dependencies.
 - `DPLLMForCausalLM.fuse_layers` and related `fuse_layers` methods are TODO/pass placeholders.
 - The CUDA extension `any_precision_ext` is mandatory for real quantized execution.
 - No local quantized model checkpoint is present in this workspace.

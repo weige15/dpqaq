@@ -1,5 +1,6 @@
 import gc
 import os
+from contextlib import contextmanager
 
 import torch
 import torch.nn as nn
@@ -9,6 +10,7 @@ from accelerate.big_modeling import init_empty_weights, load_checkpoint_and_disp
 
 from .QAQDPLLM_Linear import QAQDPLLM_Linear
 from .QAQRouter import QAQRouter, load_qaq_router_checkpoint
+from .QAQProfile import validate_route_map, validate_route_profile
 from any_precision.analyzer.analyzer import get_analyzer
 
 
@@ -99,6 +101,9 @@ class QAQDPLLMForCausalLM(nn.Module):
         self.analyzer = get_analyzer(self.model)
         self.ap_linears = []
         self.route_map = []
+        self._shared_profile_active = False
+        self._shared_route_profile = None
+
 
         self._load_quantized_modules(
             dtype=torch_dtype,
@@ -144,19 +149,23 @@ class QAQDPLLMForCausalLM(nn.Module):
         router_mode = None
 
         if 'precision' in kwargs:
+            if self._shared_profile_active:
+                raise RuntimeError("precision cannot be supplied while a shared profile is active")
             precision = kwargs.pop('precision')
             self.set_precision(precision)
         if 'router_mode' in kwargs:
             router_mode = kwargs.pop('router_mode')
+            if self._shared_profile_active and router_mode != "shared_profile":
+                raise RuntimeError("shared profile cannot be combined with another router mode")
             self.set_router_mode(router_mode)
 
-        results = self.model.forward(*args, **kwargs)
-
-        if precision is not None:
-            self.set_precision(prev_precision)
-        if router_mode is not None:
-            self.set_router_mode(prev_router_mode)
-        return results
+        try:
+            return self.model.forward(*args, **kwargs)
+        finally:
+            if precision is not None:
+                self.set_precision(prev_precision)
+            if router_mode is not None:
+                self.set_router_mode(prev_router_mode)
 
     def generate(self, *args, **kwargs):
         precision = None
@@ -165,20 +174,24 @@ class QAQDPLLMForCausalLM(nn.Module):
         prev_router_mode = self.router_mode
 
         if 'precision' in kwargs:
+            if self._shared_profile_active:
+                raise RuntimeError("precision cannot be supplied while a shared profile is active")
             precision = kwargs.pop('precision')
             self.set_precision(precision)
         if 'router_mode' in kwargs:
             router_mode = kwargs.pop('router_mode')
+            if self._shared_profile_active and router_mode != "shared_profile":
+                raise RuntimeError("shared profile cannot be combined with another router mode")
             self.set_router_mode(router_mode)
 
-        with torch.inference_mode():
-            results = self.model.generate(*args, **kwargs)
-
-        if precision is not None:
-            self.set_precision(prev_precision)
-        if router_mode is not None:
-            self.set_router_mode(prev_router_mode)
-        return results
+        try:
+            with torch.inference_mode():
+                return self.model.generate(*args, **kwargs)
+        finally:
+            if precision is not None:
+                self.set_precision(prev_precision)
+            if router_mode is not None:
+                self.set_router_mode(prev_router_mode)
 
     @staticmethod
     def _load_config(model_path, trust_remote_code=True):
@@ -348,6 +361,62 @@ class QAQDPLLMForCausalLM(nn.Module):
                     f"{idx}: checkpoint has {checkpoint_identity}, runtime has {runtime_identity}."
                 )
 
+    def shared_route_valid_bits(self):
+        return {
+            linear.route_name: list(linear._valid_bits())
+            for linear in self.ap_linears
+        }
+
+    @contextmanager
+    def shared_profile(self, route_profile):
+        """Temporarily execute every QAQ linear at its supplied route bit."""
+        previous_mode = self.router_mode
+        if previous_mode in {"fixed_low", "fixed_high", "fixed_precision"}:
+            raise RuntimeError(
+                f"shared profile is incompatible with router mode {previous_mode!r}"
+            )
+        if getattr(self, "_shared_profile_active", False):
+            raise RuntimeError("nested shared profiles are not supported")
+        if route_profile is None:
+            raise ValueError("shared_profile requires a complete route profile")
+
+        routes = validate_route_map(self.route_map)
+        valid_bits = self.shared_route_valid_bits()
+        validated = validate_route_profile(route_profile, routes, valid_bits)
+        previous_linear_modes = [linear.router_mode for linear in self.ap_linears]
+        previous_batch_policy = getattr(self, "batch_policy", "group")
+        previous_linear_batch_policies = [getattr(linear, "batch_policy", "group") for linear in self.ap_linears]
+        previous_linear_profiles = [getattr(linear, "shared_precision", None) for linear in self.ap_linears]
+        self._shared_profile_active = True
+        self._shared_route_profile = dict(validated)
+        self.batch_policy = "shared_profile"
+        for linear in self.ap_linears:
+            linear.batch_policy = "shared_profile"
+        self.set_router_mode("shared_profile")
+        try:
+            for route, linear in zip(routes, self.ap_linears, strict=True):
+                if linear.route_name != route["route_name"]:
+                    raise ValueError(
+                        f"route map order does not match linear order at {route['route_name']}"
+                    )
+                linear.set_shared_precision(validated[route["route_name"]])
+            yield dict(validated)
+        finally:
+            for linear, mode, previous_profile in zip(
+                self.ap_linears, previous_linear_modes, previous_linear_profiles, strict=True
+            ):
+                linear.set_router_mode(mode)
+                if previous_profile is None:
+                    linear.clear_shared_precision()
+                else:
+                    linear.set_shared_precision(previous_profile)
+            self.batch_policy = previous_batch_policy
+            for linear, batch_policy in zip(self.ap_linears, previous_linear_batch_policies, strict=True):
+                linear.batch_policy = batch_policy
+            self._shared_route_profile = None
+            self._shared_profile_active = False
+            self.router_mode = previous_mode
+
     def _estimator_params(self, layer_i, real_name, linear_reg_d, jl_d, required=False):
         key = (layer_i, real_name)
         if key in linear_reg_d:
@@ -391,6 +460,7 @@ class QAQDPLLMForCausalLM(nn.Module):
         total_dp_threshold_tokens = 0
         total_dp_threshold_high = 0
         per_layer = {}
+        total_shared_profile_tokens = 0
         phase_timing_totals = {}
 
         for linear in self.ap_linears:
@@ -399,6 +469,8 @@ class QAQDPLLMForCausalLM(nn.Module):
             dp_guard_count = getattr(linear, "dp_guard_count", 0)
             dp_threshold_token_count = getattr(linear, "dp_threshold_token_count", 0)
             dp_threshold_high_count = getattr(linear, "dp_threshold_high_count", 0)
+            shared_profile_tokens = getattr(linear, "shared_profile_token_count", 0)
+            total_shared_profile_tokens += int(shared_profile_tokens)
             layer_stats = {
                 "bit_counts": bit_counts,
                 "fallback_count": int(linear.fallback_count),
@@ -406,6 +478,7 @@ class QAQDPLLMForCausalLM(nn.Module):
                 "dp_threshold_token_count": int(dp_threshold_token_count),
                 "dp_threshold_high_count": int(dp_threshold_high_count),
                 "routed_token_count": int(linear.routed_token_count),
+                "shared_profile_token_count": int(shared_profile_tokens),
             }
 
             if hasattr(linear, "get_phase_timing_stats"):
@@ -429,6 +502,11 @@ class QAQDPLLMForCausalLM(nn.Module):
             total_dp_threshold_high += dp_threshold_high_count
 
         stats = {
+            "shared_profile_execution": bool(total_shared_profile_tokens),
+            "total_shared_profile_tokens": int(total_shared_profile_tokens),
+            "shared_profile_row_fraction": (
+                total_shared_profile_tokens / total_tokens if total_tokens > 0 else 0
+            ),
             "average_selected_bit": total_selected_bits / total_tokens if total_tokens > 0 else 0,
             "effective_bits": self.get_effective_bits(),
             "fallback_fraction": total_fallbacks / total_tokens if total_tokens > 0 else 0,

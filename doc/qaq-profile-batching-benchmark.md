@@ -1,6 +1,50 @@
 # QAQ Profile-Aware Batching Benchmark
 
-``` replays one frozen held-out
+## Current v2 execution contract
+
+The deployable `max_profile_sharing` policy uses each request's held-out
+`predicted_group_profile`. For the actual scheduled batch it computes the
+component-wise continuous maximum once, validates the frozen
+`layer_group_size` and profile dimension, maps each route with
+`route.layer // layer_group_size`, and projects each demand to that route's
+sorted valid bits using the conservative ceiling rule: smallest valid bit at
+or above demand, minimum below the valid range, and maximum above it. Route
+ceilings are recorded. The resulting complete route map is applied through
+`QAQDPLLMForCausalLM.shared_profile(...)` across prefill and every decode step.
+
+During pure shared execution the MLP router, confidence fallback, and DP guard
+are bypassed. The linear receives one supplied bit and executes every row at
+that bit; actual `comp_count`, per-route histograms, effective bits, and the
+decision observer therefore describe execution rather than padding estimates.
+A singleton still applies its own predicted profile. `fcfs` remains ordinary
+grouped QAQ, `fixed_high` remains fixed-high, and `length_fcfs` remains a
+scheduling-only baseline. `predicted_block_fallback_lane` retains its
+uncertain fixed-high lane. Oracle profiles are diagnostic grouping inputs only,
+not deployable shared-profile inputs. Quantile sharing remains pending.
+
+Scheduler-profile under/exact/over counts compare executed bits with each
+request's projected predicted target and report signed and absolute gaps. They
+are not real output-error safety metrics. The separate `QAQPrecisionAuditor`
+continues to define route-safety underprecision from real reference-bit output
+errors.
+
+The CPU validation command is:
+
+    python -m pytest tests/router/test_qaq_dp_guard.py tests/router/test_benchmark_qaq_profile_batching.py tests/router/test_qaq_online_scheduler_replay.py tests/router/test_qaq_shared_profile.py -q
+
+No real CUDA run was performed for this implementation change. The bounded
+lab-server command still required is a single-policy run with explicit device
+selection, for example:
+
+    CUDA_VISIBLE_DEVICES=0 python scripts/benchmark_qaq_profile_batching.py --collection_dir <REQUEST_DEMAND_COLLECTION> --analysis_json <PREDICTOR_ANALYSIS_JSON> --ap_model_path <AP_MODEL_PATH> --router_checkpoint <ROUTER_CHECKPOINT> --estimator_results <ESTIMATOR_DIR> --datasets wikitext2 --request_limit 1 --max_new_tokens 2 --arrival_rate 20 --arrival_seed 101 --predictor_seed 17 --policies max_profile_sharing --max_batch_size 2 --warmup_batches 1 --repeat 1 --skip_quality_audit --device cuda:0 --output_json <OUTPUT_PATH>
+
+The measured tables below are historical v1 artifacts and used the old
+router-max execution hook. They are not v2 shared-profile results and are not
+overwritten or reinterpreted.
+
+## Historical v1 report
+
+The v1 report replays one frozen held-out
 request stream through six policies: `fcfs`, `scalar_predicted`,
 `oracle_profile`, `predicted_profile`, `uncertainty_fallback`, and
 `fixed_high`.

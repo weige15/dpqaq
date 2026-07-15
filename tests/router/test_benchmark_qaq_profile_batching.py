@@ -1,6 +1,7 @@
 import sys
 from argparse import Namespace
 from pathlib import Path
+from types import SimpleNamespace
 
 import torch
 
@@ -11,9 +12,11 @@ if str(REPO_ROOT) not in sys.path:
 from scripts.benchmark_qaq_profile_batching import (
     Request,
     aggregate_router_stats,
+    build_shared_batch_profile,
     build_batch_plan,
     choose_batch,
     is_compatible,
+    policy_mode,
     make_arrival_trace,
     profile_padding,
     request_stream_hash,
@@ -29,6 +32,7 @@ def request(request_id, arrival=0.0, scalar=5.0, predicted=(5.0, 5.0), observed=
         continuation_length=3,
         prompt_ids=torch.arange(4),
         arrival_ms=arrival,
+        layer_group_size=4,
         predicted_scalar=scalar,
         predicted_profile=predicted,
         observed_profile=observed,
@@ -133,3 +137,38 @@ def test_aggregate_router_stats_weights_effective_bits_and_merges_histograms():
     assert result["fallback_rate"] == 1.0 / 30.0
     assert result["dp_guard_rate"] == 0.1
     assert result["per_layer_bit_histogram"]["0.q_proj"] == {"4": 10, "6": 20}
+
+def test_max_profile_sharing_constructs_predicted_profile_and_keeps_singletons_shared():
+    class FakeModel:
+        route_map = [
+            {"route_id": 0, "layer": 0, "parent": "self_attn", "name": "q_proj", "route_name": "0.q_proj"},
+            {"route_id": 1, "layer": 4, "parent": "self_attn", "name": "q_proj", "route_name": "4.q_proj"},
+        ]
+        ap_linears = []
+
+        @staticmethod
+        def shared_route_valid_bits():
+            return {"0.q_proj": [3, 4, 5, 6], "4.q_proj": [3, 5]}
+
+    batch = [request("a", predicted=(4.0, 6.0)), request("b", predicted=(5.0, 3.0))]
+    shared = build_shared_batch_profile(FakeModel(), batch)
+
+    assert shared["shared_group_profile"] == [5.0, 6.0]
+    assert shared["shared_route_profile"] == {"0.q_proj": 5, "4.q_proj": 5}
+    assert policy_mode("max_profile_sharing", [batch[0]]) == "shared_profile"
+
+    model = SimpleNamespace(ap_linears=[SimpleNamespace(batch_policy=None)], batch_policy=None)
+    from scripts.benchmark_qaq_profile_batching import set_execution_policy
+
+    assert set_execution_policy(model, "max_profile_sharing", 1) == "shared_profile"
+    assert model.ap_linears[0].batch_policy == "group"
+
+
+def test_existing_fcfs_and_fixed_high_execution_modes_remain_grouped():
+    from scripts.benchmark_qaq_profile_batching import set_execution_policy
+
+    model = SimpleNamespace(ap_linears=[SimpleNamespace(batch_policy=None)], batch_policy=None)
+    assert set_execution_policy(model, "fcfs", 4) == "group"
+    assert set_execution_policy(model, "fixed_high", 4) == "group"
+    assert policy_mode("fcfs", [request("a")]) == "mlp_multibit_dp_guard"
+    assert policy_mode("fixed_high", [request("a")]) == "fixed_high"

@@ -1,5 +1,37 @@
 # Performance Profile
 
+## Semantics and validation status
+
+This file's historical tables and phase measurements predate the explicit
+`max_profile_sharing` execution contract. They describe the old router-max
+hook and must not be read as evidence for v2 scheduler-supplied profile
+execution. Existing artifacts are retained unchanged.
+
+The v2 policy uses held-out `predicted_group_profile` values, validates their
+frozen layer-group metadata, takes one component-wise maximum over the actual
+batch, maps groups using the validated route map, and conservatively projects
+each demand onto each route's actual valid bits. The complete route profile is
+held constant through prefill and decode by
+`QAQDPLLMForCausalLM.shared_profile(...)`. Router, confidence fallback, and
+DP guard are bypassed, and actual route bits—not padding estimates—feed
+statistics and the decision observer. Singleton batches use the same path.
+
+Scheduler-profile under/exact/over accounting compares execution with each
+request's projected predicted target. It is separate from real route-safety
+underprecision reported by `QAQPrecisionAuditor` from output-error labels.
+`fcfs` remains grouped QAQ; `fixed_high` remains fixed-high; `length_fcfs`
+remains scheduling-only; and quantile sharing is pending.
+
+The required CPU validation command is:
+
+    python -m pytest tests/router/test_qaq_dp_guard.py tests/router/test_benchmark_qaq_profile_batching.py tests/router/test_qaq_online_scheduler_replay.py tests/router/test_qaq_shared_profile.py -q
+
+No real CUDA validation was run for the v2 implementation in this checkout.
+The bounded lab-server command to run after CPU validation is the single-policy
+`max_profile_sharing` benchmark command documented in
+`doc/qaq-profile-batching-benchmark.md`, with `CUDA_VISIBLE_DEVICES` set
+explicitly. No latency, throughput, or quality improvement is claimed here.
+
 ## Benchmark Command
 
 The final low/medium sweep used the existing real-CUDA benchmark path:
