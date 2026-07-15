@@ -186,6 +186,8 @@ Quality audit + CUDA-synchronized benchmark
 - `doc/qaq-profile-batching-benchmark.md`
 - `doc/qaq-lodo-three-dataset-results.md`
 - `doc/performance-profile.md`
+- `figures/gen_fig_qaq_current_progress.py`
+- `artifacts/qaq_current_progress_20260716/figures/figure_manifest.json`
 - `/tmp/qaq-task-quality-wikitext2-current.json`、`/tmp/qaq-task-quality-c4-current.json`
 - `/tmp/qaq-shared-profile-lower-demand-gpu4.json` 與其 separate quality audit
 
@@ -230,7 +232,7 @@ Quality audit + CUDA-synchronized benchmark
 
 要貼的圖片名稱：
 
-- 無（目前以 quality table 呈現）
+- `artifacts/qaq_current_progress_20260716/figures/fig_heldout_quality_perplexity.png`（quality / perplexity comparison）
 
 ## 第 9 頁：單一 request runtime baseline（歷史結果）
 
@@ -352,7 +354,7 @@ Preregistered endpoint gates：
 
 要貼的圖片名稱：
 
-- 無（目前以 LODO gate table 呈現）
+- `artifacts/qaq_current_progress_20260716/figures/fig_predictor_lodo_gates.png`（LODO gate heatmap）
 
 ## 第 13 頁：Simulator 結果與 policy selection
 
@@ -411,7 +413,8 @@ Separate route-safety audit：
 
 要貼的圖片名稱：
 
-- 無（目前以 synchronized benchmark table 呈現；新 JSON 留在 `/tmp`）
+- `artifacts/qaq_current_progress_20260716/figures/fig_shared_profile_cuda.png`（real-CUDA latency / throughput comparison）
+- `artifacts/qaq_current_progress_20260716/figures/fig_shared_profile_safety.png`（route-safety audit）
 
 ## 第 15 頁：目前已知限制與研究判讀
 
