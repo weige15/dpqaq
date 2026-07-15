@@ -151,3 +151,31 @@ Artifact status: REAL_GPU_HELDOUT.
 Artifact source hashes, five modes, 16 identical token windows per mode,
 finite logits, and fixed-high baseline deltas were independently verified.
 ```
+
+## Follow-up Shared-Profile CPU Fixture Failures
+
+The required shared-profile CPU gate initially reproduced three test-fixture
+failures, all outside production execution: the fake dequantized kernel was
+multiplied by an all-zero input; a statistics assertion included zero-valued
+candidate-bit buckets; and a route-specific fixture accidentally made bit 4
+valid for a route whose test expected it to be rejected. The production
+shared-profile path was not changed for these failures. The minimal test-only
+corrections use a one-hot fake-kernel input, assert positive executed-bit
+counts, and pass the route-specific valid-bit set explicitly. The targeted
+CPU gate is rerun after these corrections.
+
+## Follow-up Validation and GPU Allocation
+
+The corrected targeted shared-profile CPU gate passed with 33 tests, and the
+complete `tests/router` suite passed with 93 tests. Compileall, both required
+script help checks, and `git diff --check` also passed using
+`/nfs/home/s314511048/.venv/bin/python`.
+
+The bounded real-CUDA comparison subsequently completed on GPU 4, an RTX 3090.
+The larger three-repeat trace measured fixed-high at 905.337 ms p50 and 33.4677
+generated tokens/s versus max-profile-sharing at 916.279 ms p50 and 33.0366
+tokens/s; both executed at effective bit 6. The separate 241,920-decision
+route-safety audit found zero underprecision violations. A full-process Nsight
+capture included model load, so its H2D dominance is not treated as a
+serving-step bottleneck. GPU 4 is now occupied by another user's process; no
+process was interrupted.

@@ -30,13 +30,24 @@ errors.
 
 The CPU validation command is:
 
-    python -m pytest tests/router/test_qaq_dp_guard.py tests/router/test_benchmark_qaq_profile_batching.py tests/router/test_qaq_online_scheduler_replay.py tests/router/test_qaq_shared_profile.py -q
+    CUDA_VISIBLE_DEVICES='' /nfs/home/s314511048/.venv/bin/python -m pytest tests/router/test_qaq_dp_guard.py tests/router/test_benchmark_qaq_profile_batching.py tests/router/test_qaq_online_scheduler_replay.py tests/router/test_qaq_shared_profile.py -q
 
-No real CUDA run was performed for this implementation change. The bounded
-lab-server command still required is a single-policy run with explicit device
-selection, for example:
+This command passed with 33 tests; the full `tests/router` suite passed with 93
+tests. A bounded real CUDA comparison then completed on CUDA-visible device 4,
+an RTX 3090, with PyTorch 2.4.0+cu124 and commit
+`7fd62b150fb126ff48cceef2cdef02dbaf196a09`. The command used was:
 
-    CUDA_VISIBLE_DEVICES=0 python scripts/benchmark_qaq_profile_batching.py --collection_dir <REQUEST_DEMAND_COLLECTION> --analysis_json <PREDICTOR_ANALYSIS_JSON> --ap_model_path <AP_MODEL_PATH> --router_checkpoint <ROUTER_CHECKPOINT> --estimator_results <ESTIMATOR_DIR> --datasets wikitext2 --request_limit 1 --max_new_tokens 2 --arrival_rate 20 --arrival_seed 101 --predictor_seed 17 --policies max_profile_sharing --max_batch_size 2 --warmup_batches 1 --repeat 1 --skip_quality_audit --device cuda:0 --output_json <OUTPUT_PATH>
+    CUDA_VISIBLE_DEVICES=4 /nfs/home/s314511048/.venv/bin/python scripts/benchmark_qaq_profile_batching.py --collection_dir artifacts/qaq-request-demand-preregistered-v1 --analysis_json artifacts/qaq-request-demand-preregistered-v1-analysis/analysis.json --ap_model_path cache/packed/anyprec-(Meta-Llama-3.1-8B)-w6_orig3-gc1-c4_s100_blk512 --router_checkpoint checkpoints/qaq_router_llama31_8b_th005.pt --estimator_results estimator_private_values/anyprec-(Meta-Llama-3.1-8B)-w6_orig3-gc1-c4_s100_blk512/finetuned_max6.0_3b-6b_th_pb_train_0.01_1.0_1ep_targ4.5b_init_0-40_adam --tokenizer_path cache/packed/anyprec-(Meta-Llama-3.1-8B)-w6_orig3-gc1-c4_s100_blk512 --datasets wikitext2 --request_limit 4 --min_uncertain_requests 1 --max_new_tokens 8 --arrival_rate 20 --arrival_seed 101 --predictor_seed 17 --policies fixed_high fcfs max_profile_sharing --max_batch_size 2 --max_wait_ms 50 --warmup_batches 1 --repeat 3 --confidence_threshold 0.6 --device cuda:0 --torch_dtype float16 --skip_quality_audit --local_files_only --output_json /tmp/qaq-shared-profile-bounded-gpu4.json
+
+The three-repeat comparison measured fixed-high at 905.337 ms p50 and 33.4677
+generated tokens/s, versus 916.279 ms p50 and 33.0366 tokens/s for
+`max_profile_sharing`. Both used effective bit 6; shared execution covered 100%
+of rows and all 5,376 scheduler-profile decisions were exact. A separate audit
+made 241,920 real route-safety decisions with zero underprecision violations.
+All 96 WikiText2 held-out requests had group demands above 5, so the required
+conservative projection onto route-valid bits 3/4/5/6 selected bit 6 for every
+route. The current bottleneck is predictor calibration/discretization, not a
+failed shared execution path. Quantile sharing remains pending.
 
 The measured tables below are historical v1 artifacts and used the old
 router-max execution hook. They are not v2 shared-profile results and are not

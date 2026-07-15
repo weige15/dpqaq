@@ -1,5 +1,21 @@
 # Optimization Diagnosis
 
+The historical measurements and recommendations in this document describe the
+prior router-routed QAQ path, not explicit v2 `max_profile_sharing`. The v2
+path bypasses the router. On 2026-07-16, GPU 4 ran two bounded real-CUDA
+comparisons and a separate route-safety audit on an RTX 3090. Shared execution
+used effective bit 6, covered 100% of rows, and produced zero audited
+underprecision decisions. The current bottleneck is profile calibration, not
+an established CUDA execution hotspot; no production optimization is claimed.
+
+Current v2 observation (2026-07-16): the larger three-repeat trace measured
+`fixed_high` at 905.337 ms p50 and 33.4677 generated tokens/s versus
+`max_profile_sharing` at 916.279 ms p50 and 33.0366 tokens/s. Both used bit 6;
+the separate 241,920-decision real route-safety audit found zero underprecision.
+All 96 WikiText2 held-out requests had group demands above 5, so projection onto
+valid bits 3/4/5/6 selected bit 6 for every route. The first optimization should
+therefore be predictor calibration/validation, not router fusion or a kernel edit.
+
 ## Baseline
 
 Known reliable prior benchmark baseline: Unknown. The closest latency references are in-run baselines from `artifacts/qaq_dp_guard_benchmark_20260708_230117/benchmark.json`.

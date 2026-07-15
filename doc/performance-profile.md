@@ -24,13 +24,36 @@ remains scheduling-only; and quantile sharing is pending.
 
 The required CPU validation command is:
 
-    python -m pytest tests/router/test_qaq_dp_guard.py tests/router/test_benchmark_qaq_profile_batching.py tests/router/test_qaq_online_scheduler_replay.py tests/router/test_qaq_shared_profile.py -q
+    CUDA_VISIBLE_DEVICES='' /nfs/home/s314511048/.venv/bin/python -m pytest tests/router/test_qaq_dp_guard.py tests/router/test_benchmark_qaq_profile_batching.py tests/router/test_qaq_online_scheduler_replay.py tests/router/test_qaq_shared_profile.py -q
 
-No real CUDA validation was run for the v2 implementation in this checkout.
-The bounded lab-server command to run after CPU validation is the single-policy
-`max_profile_sharing` benchmark command documented in
-`doc/qaq-profile-batching-benchmark.md`, with `CUDA_VISIBLE_DEVICES` set
-explicitly. No latency, throughput, or quality improvement is claimed here.
+The targeted command passed with 33 tests and the full router suite passed with
+93 tests. The implementation was then exercised on GPU 4, an isolated RTX 3090,
+using the real CUDA kernels. The two bounded timing runs and the separate audit
+were written under `/tmp` and are not repository artifacts.
+
+    CUDA_VISIBLE_DEVICES=4 /nfs/home/s314511048/.venv/bin/python scripts/benchmark_qaq_profile_batching.py --collection_dir artifacts/qaq-request-demand-preregistered-v1 --analysis_json artifacts/qaq-request-demand-preregistered-v1-analysis/analysis.json --ap_model_path cache/packed/anyprec-(Meta-Llama-3.1-8B)-w6_orig3-gc1-c4_s100_blk512 --router_checkpoint checkpoints/qaq_router_llama31_8b_th005.pt --estimator_results estimator_private_values/anyprec-(Meta-Llama-3.1-8B)-w6_orig3-gc1-c4_s100_blk512/finetuned_max6.0_3b-6b_th_pb_train_0.01_1.0_1ep_targ4.5b_init_0-40_adam --tokenizer_path cache/packed/anyprec-(Meta-Llama-3.1-8B)-w6_orig3-gc1-c4_s100_blk512 --datasets wikitext2 --request_limit 4 --min_uncertain_requests 1 --max_new_tokens 8 --arrival_rate 20 --arrival_seed 101 --predictor_seed 17 --policies fixed_high fcfs max_profile_sharing --max_batch_size 2 --max_wait_ms 50 --warmup_batches 1 --repeat 3 --confidence_threshold 0.6 --device cuda:0 --torch_dtype float16 --skip_quality_audit --local_files_only --output_json /tmp/qaq-shared-profile-bounded-gpu4.json
+
+The first run used `request_limit=4`, `min_uncertain_requests=1`,
+`max_batch_size=2`, `repeat=3`, and compared `fixed_high`, `fcfs`, and
+`max_profile_sharing` on GPU 4, an RTX 3090. The second run used eight
+requests, `min_uncertain_requests=0`, `max_batch_size=4`, and compared
+`fixed_high` with `max_profile_sharing` for three repeats on the same device.
+The runs completed as `REAL_CUDA_BENCHMARK` on commit
+`7fd62b150fb126ff48cceef2cdef02dbaf196a09`, with PyTorch 2.4.0+cu124 and CUDA
+12.4. The second run measured fixed-high at 905.337 ms p50 and 33.4677
+generated tokens/s, versus 916.279 ms p50 and 33.0366 tokens/s for shared
+execution; both used effective bit 6.
+The shared run used shared execution for 100% of rows, with zero fallbacks and
+zero DP guards; all 5,376 scheduler-profile decisions were exact. Its separate
+real-output-error audit made 241,920 decisions and found zero route-safety
+underprecision violations, with 216,870 over-precision and 25,050 exact
+decisions.
+
+The frozen held-out predictor is the immediate research bottleneck: across all
+96 WikiText2 test requests, every group demand was above 5 (group maxima ranged
+from 5.4675 to 5.5362), so conservative projection onto valid bits 3/4/5/6
+selected bit 6 for every route. This is a calibration/discretization finding,
+not evidence that the shared execution mechanism is broken.
 
 ## Benchmark Command
 
@@ -148,6 +171,11 @@ perplexity against fixed-high:
 | C4 / fixed_high | 11.8923 | +0.0000 | 6.0000 | 0.000% | 0.000% |
 
 ## Hotspots
+The phase percentages below are historical router-routed/v1 evidence and must
+not be used to attribute v2 shared-profile execution. A current full-process
+Nsight capture of the bounded shared run recorded model-load host-to-device
+transfers as 99.9% of H2D time; because loading was inside the capture, this is
+not a serving-step bottleneck. A post-load phase-isolated trace remains pending.
 
 The successful CUDA-only torch.profiler traces were paired with synchronized
 CUDA-event phase timing in `QAQDPLLM_Linear`. On a representative native-32

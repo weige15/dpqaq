@@ -26,7 +26,9 @@ def install_fake_kernels(monkeypatch):
     monkeypatch.setattr(qaq_linear_module, "dequant_kbit", fake_dequant_kbit)
 
 
-def make_linear(route_name="0.q_proj", router=None, router_mode="shared_profile", maxmem=6):
+def make_linear(route_name="0.q_proj", router=None, router_mode="shared_profile", maxmem=6, precisions=None):
+    if precisions is None:
+        precisions = [3, 4, 5, 6]
     return qaq_linear_module.QAQDPLLM_Linear(
         in_features=32,
         out_features=1,
@@ -35,7 +37,7 @@ def make_linear(route_name="0.q_proj", router=None, router_mode="shared_profile"
         route_id=0,
         route_name=route_name,
         bias=False,
-        precisions=[3, 4, 5, 6],
+        precisions=precisions,
         dtype=torch.float32,
         device=torch.device("cpu"),
         maxmem=maxmem,
@@ -155,6 +157,7 @@ def test_linear_shared_profile_uses_one_bit_for_every_row_and_bypasses_router(mo
     observed = []
     linear.set_decision_observer(lambda module, x, bits: observed.append(bits.clone()))
     x = torch.zeros(3, 32)
+    x[:, 0] = 1.0
 
     linear.set_shared_precision(5)
     y = linear(x)
@@ -187,7 +190,7 @@ def make_fake_model(linears, mode="mlp_multibit"):
 def test_model_shared_profile_restores_state_after_success_and_exception(monkeypatch):
     install_fake_kernels(monkeypatch)
     first = make_linear("0.q_proj", router_mode="mlp_multibit")
-    second = make_linear("4.q_proj", router_mode="mlp_multibit", maxmem=5)
+    second = make_linear("4.q_proj", router_mode="mlp_multibit", maxmem=5, precisions=[3, 5])
     model = make_fake_model([first, second])
     profile = {"0.q_proj": 4, "4.q_proj": 5}
 
@@ -214,7 +217,7 @@ def test_model_shared_profile_restores_state_after_success_and_exception(monkeyp
 def test_model_stats_report_actual_shared_execution_without_routed_rows(monkeypatch):
     install_fake_kernels(monkeypatch)
     first = make_linear("0.q_proj", router_mode="mlp_multibit")
-    second = make_linear("4.q_proj", router_mode="mlp_multibit", maxmem=5)
+    second = make_linear("4.q_proj", router_mode="mlp_multibit", maxmem=5, precisions=[3, 5])
     model = make_fake_model([first, second])
     with model.shared_profile({"0.q_proj": 4, "4.q_proj": 5}):
         first(torch.zeros(2, 32))
@@ -225,14 +228,14 @@ def test_model_stats_report_actual_shared_execution_without_routed_rows(monkeypa
     assert stats["total_shared_profile_tokens"] == 4
     assert stats["total_fallbacks"] == 0
     assert stats["total_dp_guard_triggers"] == 0
-    assert stats["per_layer"]["0.q_proj"]["bit_counts"] == {"4": 2}
-    assert stats["per_layer"]["4.q_proj"]["bit_counts"] == {"5": 2}
+    assert {bit: count for bit, count in stats["per_layer"]["0.q_proj"]["bit_counts"].items() if count} == {"4": 2}
+    assert {bit: count for bit, count in stats["per_layer"]["4.q_proj"]["bit_counts"].items() if count} == {"5": 2}
     assert stats["per_layer"]["0.q_proj"]["routed_token_count"] == 0
 
 
 def test_model_shared_profile_rejects_fixed_modes_and_invalid_route_bits():
     first = make_linear("0.q_proj", router_mode="fixed_high")
-    second = make_linear("4.q_proj", router_mode="fixed_high", maxmem=5)
+    second = make_linear("4.q_proj", router_mode="fixed_high", maxmem=5, precisions=[3, 5])
     model = make_fake_model([first, second], mode="fixed_high")
     with pytest.raises(RuntimeError, match="incompatible"):
         with model.shared_profile({"0.q_proj": 4, "4.q_proj": 5}):
