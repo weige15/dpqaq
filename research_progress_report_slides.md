@@ -7,8 +7,9 @@
 
 頁面內容：
 
-- 題目：QAQ-style Query-Adaptive Precision Routing on Any-Precision LLM
-- 核心目標：根據不同 query / request 的精度需求，動態選擇推論 bit-width。
+- 題目：Precision-Aware Dynamic Batching for Mixed-Precision LLM Serving
+- 核心目標：設計並評估能根據 request 精度需求組成 batch 的 serving 方法，改善 throughput、latency 與 memory efficiency，同時維持 model quality。
+- QAQ 定位：QAQ-style query-adaptive precision routing 是目前用來提供 mixed-precision profile 的機制，不是完整研究問題本身。
 - 目前進度：已完成單一 request QAQ 路徑、DP threshold guard、real trace collection、trace-driven simulation、初步 GPU batched replay。
 - 報告重點：目前架構、目前結果、尚未驗證的限制、下一步實驗。
 
@@ -20,9 +21,10 @@
 
 頁面內容：
 
-- 現有 fixed precision inference 對所有 request 使用同一精度。
-- 問題：簡單 request 可能不需要高精度，困難 request 又可能在低精度下品質下降。
-- 研究問題：能不能用 query-aware routing 在品質可控的前提下降低 effective bits，並讓 serving batching 更有效？
+- 普通 dynamic batching 通常根據 arrival time、sequence length 或 queue state 組 batch，沒有充分利用 request 之間不同的 precision demand。
+- 單獨的 query-adaptive routing 能為 request 選擇不同 bit-width，但不保證這些決策適合 batched execution。
+- 研究問題：能不能將 request 的 mixed-precision profile 納入 dynamic batching，在品質與 deadline 可控的前提下改善 throughput 與 latency？
+- 必須分開驗證：batching policy 的效果、precision routing 的效果，以及兩者組合後是否真的有 serving benefit。
 - 目前方法不是重新訓練模型，而是在 Any-Precision weights 上加 runtime precision control。
 
 要貼的圖片名稱：

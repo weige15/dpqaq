@@ -4,9 +4,13 @@
 
 This repository is `dpqaq`.
 
-It is built on DP-LLM / Any-Precision LLM, but it is no longer just a plain DP-LLM fork. The current research goal is:
+It is built on DP-LLM / Any-Precision LLM, but it is no longer just a plain DP-LLM fork. The current research topic and objective are:
 
-> QAQ-style query-adaptive precision routing on Any-Precision weights, with optional DP-LLM-inspired error estimation / threshold guarding.
+> Precision-aware dynamic batching for mixed-precision LLM serving: determine whether
+> batching requests according to their precision requirements can improve the
+> latency/throughput/quality tradeoff. QAQ-style query-adaptive precision routing
+> on Any-Precision weights is the current mixed-precision mechanism used to study
+> this question, with optional DP-LLM-inspired error estimation / threshold guarding.
 
 Do not treat this repository as a fresh implementation. QAQ-specific work already exists and should be audited, tested, and improved incrementally.
 
@@ -44,7 +48,23 @@ Important QAQ files:
 
 ## Core research objective
 
-The goal is not just to make code run.
+The primary research objective is to design and evaluate a precision-aware dynamic
+batching method for LLM inference that jointly considers request batching and
+mixed-precision allocation to improve throughput, latency, and memory efficiency
+while preserving model quality.
+
+The central research question is:
+
+> Can dynamically grouping requests with compatible precision profiles improve
+> serving efficiency over ordinary dynamic batching, without unacceptable quality
+> loss, fallback frequency, or deadline violations?
+
+QAQ routing is a mechanism and experimental condition within this objective; it is
+not, by itself, the complete research contribution. The project must therefore
+separate the effect of the batching policy from the effect of the precision router.
+
+The goal is not just to make code run or to demonstrate that a router produces
+different bit decisions.
 
 The goal is a research-quality implementation that can support reliable claims about:
 

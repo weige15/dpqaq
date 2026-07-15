@@ -1,25 +1,52 @@
-# QAQ Dynamic Batching Design
+# Precision-Aware Dynamic Batching Design
 
-This document freezes the first research-facing design for precision-aware
-dynamic batching in `dpqaq`. It is a pre-implementation contract: no batching
-speedup, quality preservation, or throughput claim is valid until the validation
-gates below pass on real traces and GPU-server measurements.
+This document is the canonical research-facing design for precision-aware
+dynamic batching in `dpqaq`. The primary topic is dynamic batching; mixed
+precision is the control and resource dimension that the batching policy must
+exploit. QAQ-style query-adaptive routing is the current precision mechanism,
+not the complete research objective.
+
+This is a pre-implementation contract: no batching speedup, quality preservation,
+or throughput claim is valid until the validation gates below pass on real traces
+and GPU-server measurements.
 
 ## Goal
 
-Evaluate whether QAQ-style precision profiles can be used as a serving-time
-batching signal.
+Design and evaluate a precision-aware dynamic batching method for LLM inference
+that jointly considers request batching and mixed-precision allocation to improve
+throughput, latency, and memory efficiency while preserving model quality.
 
-The first implementation must answer three questions:
+The central research question is:
+
+> Can dynamically grouping requests with compatible precision profiles improve
+> serving efficiency over ordinary dynamic batching, without unacceptable quality
+> loss, fallback frequency, or deadline violations?
+
+The working hypothesis is deliberately testable rather than assumed: if requests
+with similar precision demand are grouped into compatible batches, the runtime
+may reduce precision-profile conflicts, unnecessary high-bit execution, and
+quality-risky under-precision decisions. The experiments must also test the
+opposite outcome—that profile fragmentation, router overhead, or queueing delay
+can erase the potential benefit.
+
+The first implementation must answer four questions:
 
 - Do real prompts produce reusable precision profiles?
 - Does profile-aware grouping improve the latency/throughput/quality tradeoff
-  after queueing delay is included?
+  over ordinary dynamic batching on the same real request trace?
+- Does that improvement remain after queueing delay is included?
 - Are fallback and under-precision events rare enough to preserve quality?
+
+The comparison must distinguish the batching contribution from the precision
+contribution. At minimum, the evaluation needs ordinary dynamic batching with
+fixed precision, QAQ routing without profile-aware grouping, and the proposed
+precision-aware batching policy.
 
 ## Non-Goals
 
 - Do not replace the existing QAQ router or quantized linear path.
+- Do not treat QAQ routing alone as the batching contribution or assume that
+  lower effective bits imply higher serving throughput.
 - Do not implement a full production serving engine before trace and simulation
   evidence justifies it.
 - Do not claim performance from simulator results.
