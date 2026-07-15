@@ -124,45 +124,45 @@ label = 最小的安全 bit b，使 rel_error_b <= error_threshold
 
 - 無
 
-## 第 6 頁：Serving-aware dynamic batching 架構
+## 第 6 頁：面向服務的動態批次處理架構
 
 頁面內容：
 
 ```text
-Prompt set / request stream
+提示詞集合／請求串流
         |
         v
-Real QAQ trace + prompt-only predictors
-- per-request selected bits / group demand
-- uncertainty and conservative fallback lane
+真實 QAQ 軌跡 + 僅使用提示詞的預測器
+- 每個請求的選定位元寬度／群組精度需求
+- 不確定性與保守回退佇列
         |
         v
-Profile extraction
-- scalar bit budget
-- coarse block precision profile
-- workload type / arrival time / prompt length
+精度設定檔擷取
+- 純量位元預算
+- 粗粒度區塊精度設定檔
+- 工作負載類型／到達時間／提示詞長度
         |
         v
-Scheduler
-- ordinary dynamic batching
-- scalar budget batching
-- block profile batching
-- max / quantile profile sharing
+批次排程器
+- 一般動態批次處理
+- 依純量預算組批
+- 依區塊精度設定檔組批
+- 最大值／分位數精度設定檔共享
         |
         v
-Executor
-- fixed-high or grouped QAQ baseline
-- shared route profile across prefill and decode
+執行器
+- 固定最高精度或分組 QAQ 基準線
+- 在預填充與逐步解碼階段共用路由精度設定檔
         |
         v
-Quality audit + CUDA-synchronized benchmark
+品質與安全性檢查 + CUDA 同步效能基準測試
 ```
 
 目前定位：
 
-- Trace 是 real QAQ generation；simulator 是 policy selection tool，不是 performance claim。
-- v2 shared-profile execution 已完成，且 bounded real-CUDA run 已通過。
-- Predictor 的 cross-dataset transfer gate 尚未通過，因此 scheduler integration 尚未被視為可部署的 adaptive decision。
+- 軌跡來自真實 QAQ 生成；模擬器只用於選擇策略，不代表實際效能。
+- v2 共用精度設定檔執行路徑已完成，且受限規模的真實 CUDA 測試已通過。
+- 預測器尚未通過跨資料集轉移閘門，因此排程器整合尚未被視為可部署的自適應決策。
 
 要貼的圖片名稱：
 
